@@ -1,6 +1,12 @@
 import importlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+import httpx
 
 api_tools = importlib.import_module('platform-bridge.agent_api_tools')
 
@@ -141,4 +147,118 @@ class AgentApiToolsTests(unittest.IsolatedAsyncioTestCase):
         client = AsyncMock()
         result = await api_tools.execute(client, {'host': 'http://tb.test', 'api_key': 'private'}, 'thingsboard_rpc', {'device_id': '11111111-2222-3333-4444-555555555555', 'method': 'setPower'}, read_only=True)
         self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'forbidden')
         client.post.assert_not_awaited()
+
+    @patch.object(api_tools, 'authorize_rpc', new_callable=AsyncMock, return_value=None)
+    async def test_two_way_confirmed_offline_and_timeout_error_codes(self, authorize):
+        device_id = '11111111-2222-3333-4444-555555555555'
+        config = {'host': 'http://tb.test', 'api_key': 'private'}
+
+        ok_resp = MagicMock(status_code=200)
+        ok_resp.json.return_value = {'POWER': 'ON'}
+        offline_resp = MagicMock(status_code=200)
+        offline_resp.json.return_value = {'error': 'Device offline or awaiting manual recovery'}
+        timeout_resp = MagicMock(status_code=504, text='timeout')
+
+        client = AsyncMock()
+        client.post.side_effect = [ok_resp, offline_resp, timeout_resp, httpx.TimeoutException('read timed out')]
+
+        ok = await api_tools.execute(client, config, 'thingsboard_rpc',
+            {'device_id': device_id, 'method': 'setPower', 'params': {'state': True}, 'two_way': True}, profile_id='agent-a')
+        self.assertTrue(ok['success'])
+        self.assertTrue(ok['confirmed'])
+        self.assertEqual(ok['delivery'], 'device_response')
+
+        offline = await api_tools.execute(client, config, 'thingsboard_rpc',
+            {'device_id': device_id, 'method': 'setPower', 'params': {'state': True}, 'two_way': True}, profile_id='agent-a')
+        self.assertFalse(offline['success'])
+        self.assertFalse(offline['confirmed'])
+        self.assertEqual(offline['error_code'], 'device_offline')
+
+        t504 = await api_tools.execute(client, config, 'thingsboard_rpc',
+            {'device_id': device_id, 'method': 'setPower', 'params': {'state': True}, 'two_way': True}, profile_id='agent-a')
+        self.assertFalse(t504['success'])
+        self.assertEqual(t504['error_code'], 'timeout')
+
+        texc = await api_tools.execute(client, config, 'thingsboard_rpc',
+            {'device_id': device_id, 'method': 'setPower', 'params': {'state': True}, 'two_way': True}, profile_id='agent-a')
+        self.assertFalse(texc['success'])
+        self.assertEqual(texc['error_code'], 'timeout')
+
+    @unittest.skipUnless(importlib.util.find_spec('jsonschema'), 'requires jsonschema')
+    async def test_capability_discovery_validation_and_policy_with_real_registry(self):
+        dev_a = '11111111-2222-3333-4444-555555555551'
+        dev_b = '11111111-2222-3333-4444-555555555552'
+        caps_a = {'methods': {
+            'setPower': {'description': 'Set power', 'params': {'type': 'object', 'properties': {'state': {'type': 'boolean'}}, 'required': ['state'], 'additionalProperties': False}},
+            'getPower': {'description': 'Get power', 'params': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
+            'togglePower': {'description': 'Toggle power', 'params': {'type': 'object', 'properties': {}, 'additionalProperties': False}},
+        }}
+        caps_b = {'methods': {
+            'setPower': caps_a['methods']['setPower'],
+            'getPower': caps_a['methods']['getPower'],
+        }}
+
+        def make_resp(data, status=200):
+            r = MagicMock(status_code=status, content=json.dumps(data).encode(), text=json.dumps(data))
+            r.json.return_value = data
+            r.raise_for_status = lambda: None
+            return r
+
+        async def mock_get(url, **kwargs):
+            if '/api/tenant/devices' in url:
+                return make_resp({'data': [
+                    {'id': {'id': dev_a}, 'name': 'Simulated Tasmota A', 'type': 'default'},
+                    {'id': {'id': dev_b}, 'name': 'Simulated Tasmota B', 'type': 'default'},
+                ], 'hasNext': False})
+            if f'/{dev_a}/values/attributes/CLIENT_SCOPE' in url:
+                return make_resp([{'key': 'rpcCapabilities', 'value': caps_a}])
+            if f'/{dev_b}/values/attributes/CLIENT_SCOPE' in url:
+                return make_resp([{'key': 'rpcCapabilities', 'value': caps_b}])
+            if '/values/attributes/' in url:
+                return make_resp([])
+            if '/api/tenant/dashboards' in url or '/api/ruleChains' in url:
+                return make_resp({'data': [], 'hasNext': False})
+            return make_resp({})
+
+        async def mock_post(url, **kwargs):
+            return make_resp({'POWER': 'ON'}, 200)
+
+        http = AsyncMock()
+        http.get.side_effect = mock_get
+        http.post.side_effect = mock_post
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=http)
+        context.__aexit__ = AsyncMock(return_value=False)
+
+        config = {'host': 'http://tb.test', 'api_key': 'key-a'}
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'PLATFORM_DATA_DIR': tmp}), \
+                patch('httpx.AsyncClient', return_value=context):
+            listed = await api_tools.execute(http, config, 'list_available_rpc',
+                {'device_identifier': 'Simulated Tasmota A'}, profile_id='agent-a')
+            self.assertTrue(listed['success'])
+            self.assertEqual({c['method'] for c in listed['capabilities']}, {'setPower', 'getPower', 'togglePower'})
+
+            bad_method = await api_tools.execute(http, config, 'execute_device_action',
+                {'device_identifier': 'Simulated Tasmota B', 'method': 'togglePower', 'params': {}}, profile_id='agent-a')
+            self.assertFalse(bad_method['success'])
+            self.assertEqual(bad_method['error_code'], 'unsupported_method')
+
+            bad_params = await api_tools.execute(http, config, 'execute_device_action',
+                {'device_identifier': 'Simulated Tasmota A', 'method': 'setPower', 'params': {'state': 'yes'}}, profile_id='agent-a')
+            self.assertFalse(bad_params['success'])
+            self.assertEqual(bad_params['error_code'], 'invalid_params')
+
+            denied_ro = await api_tools.execute(http, config, 'execute_device_action',
+                {'device_identifier': 'Simulated Tasmota A', 'method': 'setPower', 'params': {'state': True}},
+                read_only=True, profile_id='agent-ro')
+            self.assertFalse(denied_ro['success'])
+            self.assertEqual(denied_ro['error_code'], 'forbidden')
+
+            ok = await api_tools.execute(http, config, 'execute_device_action',
+                {'device_identifier': 'Simulated Tasmota A', 'method': 'setPower', 'params': {'state': True}}, profile_id='agent-a')
+            self.assertTrue(ok['success'])
+            self.assertTrue(ok['confirmed'])
+            self.assertEqual(ok['delivery'], 'device_response')
+            self.assertEqual(ok['response'], {'POWER': 'ON'})

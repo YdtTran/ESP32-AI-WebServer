@@ -1,4 +1,9 @@
+import asyncio
 import importlib
+import importlib.util
+import json
+import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -248,6 +253,186 @@ class AgentThingsBoardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result['tool_calls']), 2)
         self.assertEqual(client.get.await_count, 2)
         self.assertEqual(client.get.await_args.kwargs['headers']['X-Authorization'], 'ApiKey private')
+
+    async def test_concurrent_agents_stay_isolated_and_enforce_policies(self):
+        dev_a = '11111111-2222-3333-4444-555555555551'
+        agent_a = {'id': 'agent-a', 'name': 'Alpha', 'tool_policy': 'full_control',
+                   'integrations': {'thingsboard': {'host': 'http://tb-a.test', 'api_key': 'key-a'}}}
+        agent_b = {'id': 'agent-b', 'name': 'Beta', 'tool_policy': 'read_only_telemetry',
+                   'integrations': {'thingsboard': {'host': 'http://tb-b.test', 'api_key': 'key-b'}}}
+
+        def resp(data, status=200):
+            r = MagicMock(status_code=status)
+            r.json.return_value = data
+            r.raise_for_status = lambda: None
+            return r
+
+        async def mock_post(url, **kwargs):
+            if url.endswith('/v1/chat/completions'):
+                user_msg = kwargs['json']['messages'][-1]['content'] if kwargs['json']['messages'][-1]['role'] == 'user' else None
+                if user_msg == 'turn on alpha':
+                    return resp({'choices': [{'message': {'role': 'assistant', 'tool_calls': [{'id': 'a1', 'function': {
+                        'name': 'execute_device_action',
+                        'arguments': json.dumps({'device_identifier': dev_a, 'method': 'setPower', 'params': {'state': True}})
+                    }}]}}]})
+                if user_msg == 'turn on beta':
+                    return resp({'choices': [{'message': {'role': 'assistant', 'tool_calls': [{'id': 'b1', 'function': {
+                        'name': 'execute_device_action',
+                        'arguments': json.dumps({'device_identifier': dev_a, 'method': 'setPower', 'params': {'state': True}})
+                    }}]}}]})
+                return resp({'choices': [{'message': {'content': 'done'}}]})
+            if url.startswith('http://tb-a.test/api/rpc/twoway/'):
+                self.assertEqual(kwargs['headers']['X-Authorization'], 'ApiKey key-a')
+                return resp({'POWER': 'ON'}, 200)
+            self.fail(f'Unexpected POST to {url}')
+
+        client = AsyncMock()
+        client.post.side_effect = mock_post
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=client)
+        context.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.dict('os.environ', {'THINGSBOARD_ALLOWED_ORIGINS': 'http://tb-a.test,http://tb-b.test'}), \
+                patch('httpx.AsyncClient', return_value=context), \
+                patch.object(bridge.agent_api_tools, 'authorize_rpc', new=AsyncMock(return_value=None)):
+            res_a, res_b = await asyncio.gather(
+                bridge.run_agent_chat(agent_a, bridge.AgentChatRequest(message='turn on alpha')),
+                bridge.run_agent_chat(agent_b, bridge.AgentChatRequest(message='turn on beta')),
+            )
+
+        tc_a = json.loads(res_a['tool_calls'][0]['result'])
+        tc_b = json.loads(res_b['tool_calls'][0]['result'])
+        self.assertTrue(tc_a['success'])
+        self.assertTrue(tc_a['confirmed'])
+        self.assertFalse(tc_b['success'])
+        self.assertEqual(tc_b['error_code'], 'forbidden')
+
+    @unittest.skipUnless(importlib.util.find_spec('jsonschema'), 'requires jsonschema')
+    async def test_console_agent_chat_to_mcp_to_tasmota_e2e_workflow(self):
+        from pathlib import Path
+        from tools.tasmota_bridge import TasmotaBridge, device_capabilities
+        from tools.virtual_tasmota import power_command
+
+        dev_a = '11111111-2222-3333-4444-555555555551'
+        dev_b = '11111111-2222-3333-4444-555555555552'
+        cfg = json.loads((Path(__file__).resolve().parents[1] / 'tools/tasmota-bridge.example.json').read_text())
+        relay_power = {'relay-a': False, 'relay-b': False}
+        tb_attributes = {
+            dev_a: {'rpcCapabilities': device_capabilities(cfg['devices']['relay-a'])},
+            dev_b: {'rpcCapabilities': device_capabilities(cfg['devices']['relay-b'])},
+        }
+        tb_telemetry = {'Simulated Tasmota A': {'POWER': [{'value': 'OFF', 'ts': 1000}]}}
+        rpc_replies = []
+        seq = {'id': 0}
+
+        def on_mqtt_command(topic, payload):
+            relay_key = 'relay-a' if 'relay-a' in topic else 'relay-b'
+            relay_power[relay_key] = power_command(payload, relay_power[relay_key])
+            state_str = 'ON' if relay_power[relay_key] else 'OFF'
+            tb_telemetry[cfg['devices'][relay_key]['name']] = {'POWER': [{'value': state_str, 'ts': 2000}]}
+            tasmota_bridge.result(relay_key, {'POWER': state_str})
+
+        tasmota_bridge = TasmotaBridge(cfg['devices'], on_mqtt_command, rpc_replies.append)
+        tasmota_bridge.set_online('relay-a', True)
+        tasmota_bridge.set_online('relay-b', True)
+
+        agent = {'id': 'agent-e2e', 'name': 'E2E Console Agent', 'language': 'en', 'tool_policy': 'full_control',
+                 'integrations': {'thingsboard': {'host': 'http://tb.test', 'api_key': 'e2e-key'}}}
+
+        def resp(data, status=200):
+            r = MagicMock(status_code=status, content=json.dumps(data).encode(), text=json.dumps(data))
+            r.json.return_value = data
+            r.raise_for_status = lambda: None
+            return r
+
+        async def mock_get(url, **kwargs):
+            if '/api/tenant/devices' in url:
+                return resp({'data': [
+                    {'id': {'id': dev_a}, 'name': 'Simulated Tasmota A', 'type': 'default'},
+                    {'id': {'id': dev_b}, 'name': 'Simulated Tasmota B', 'type': 'default'},
+                ], 'hasNext': False})
+            if f'/{dev_a}/values/attributes/CLIENT_SCOPE' in url:
+                return resp([{'key': 'rpcCapabilities', 'value': tb_attributes[dev_a]['rpcCapabilities']}])
+            if f'/{dev_b}/values/attributes/CLIENT_SCOPE' in url:
+                return resp([{'key': 'rpcCapabilities', 'value': tb_attributes[dev_b]['rpcCapabilities']}])
+            if '/values/attributes/' in url:
+                return resp([])
+            if f'/{dev_a}/values/timeseries' in url:
+                return resp(tb_telemetry['Simulated Tasmota A'])
+            if '/api/tenant/dashboards' in url or '/api/ruleChains' in url:
+                return resp({'data': [], 'hasNext': False})
+            return resp({})
+
+        scripted_calls = []
+
+        async def mock_post(url, **kwargs):
+            if url.endswith('/v1/chat/completions'):
+                msgs = kwargs['json']['messages']
+                if msgs[-1]['role'] == 'user':
+                    return resp({'choices': [{'message': {'role': 'assistant', 'tool_calls': [scripted_calls.pop(0)]}}]})
+                return resp({'choices': [{'message': {'content': 'OK: ' + msgs[-1]['content']}}]})
+            if '/api/rpc/twoway/' in url:
+                target_id = url.rsplit('/', 1)[-1]
+                dev_name = 'Simulated Tasmota A' if target_id == dev_a else 'Simulated Tasmota B'
+                seq['id'] += 1
+                req_id = seq['id']
+                before = len(rpc_replies)
+                body = kwargs['json']
+                tasmota_bridge.request({'device': dev_name, 'data': {
+                    'id': req_id, 'method': body['method'], 'params': body['params']}})
+                self.assertEqual(len(rpc_replies), before + 1)
+                return resp(rpc_replies[-1]['data'], 200)
+            self.fail(f'Unexpected POST {url}')
+
+        client = AsyncMock()
+        client.get.side_effect = mock_get
+        client.post.side_effect = mock_post
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=client)
+        context.__aexit__ = AsyncMock(return_value=False)
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {'PLATFORM_DATA_DIR': tmp}), \
+                patch('httpx.AsyncClient', return_value=context):
+            # 1. Discover devices
+            scripted_calls.append({'id': 'c1', 'function': {'name': 'list_devices', 'arguments': '{}'}})
+            r1 = await bridge.run_agent_chat(agent, bridge.AgentChatRequest(message='What IoT devices are available?'))
+            self.assertIn('Simulated Tasmota A', r1['tool_calls'][0]['result'])
+            self.assertIn('Simulated Tasmota B', r1['tool_calls'][0]['result'])
+
+            # 2. Discover capabilities for Simulated Tasmota A
+            scripted_calls.append({'id': 'c2', 'function': {'name': 'list_available_rpc',
+                'arguments': json.dumps({'device_identifier': 'Simulated Tasmota A'})}})
+            r2 = await bridge.run_agent_chat(agent, bridge.AgentChatRequest(message='What can Simulated Tasmota A do?'))
+            caps_result = json.loads(r2['tool_calls'][0]['result'])
+            self.assertEqual({c['method'] for c in caps_result['capabilities']}, {'setPower', 'getPower', 'togglePower'})
+
+            # 3. Execute valid two-way RPC to turn on Simulated Tasmota A -> hits virtual Tasmota
+            scripted_calls.append({'id': 'c3', 'function': {'name': 'execute_device_action',
+                'arguments': json.dumps({'device_identifier': 'Simulated Tasmota A', 'method': 'setPower', 'params': {'state': True}})}})
+            r3 = await bridge.run_agent_chat(agent, bridge.AgentChatRequest(message='Turn on Simulated Tasmota A.'))
+            rpc_ok = json.loads(r3['tool_calls'][0]['result'])
+            self.assertTrue(rpc_ok['success'])
+            self.assertTrue(rpc_ok['confirmed'])
+            self.assertEqual(rpc_ok['delivery'], 'device_response')
+            self.assertEqual(rpc_ok['response'], {'POWER': 'ON'})
+            self.assertTrue(relay_power['relay-a'])
+
+            # 4. Unsupported RPC on Simulated Tasmota B must be rejected before hitting bridge
+            scripted_calls.append({'id': 'c4', 'function': {'name': 'execute_device_action',
+                'arguments': json.dumps({'device_identifier': 'Simulated Tasmota B', 'method': 'togglePower', 'params': {}})}})
+            r4 = await bridge.run_agent_chat(agent, bridge.AgentChatRequest(message='Toggle Simulated Tasmota B.'))
+            rpc_bad = json.loads(r4['tool_calls'][0]['result'])
+            self.assertFalse(rpc_bad['success'])
+            self.assertEqual(rpc_bad['error_code'], 'unsupported_method')
+            self.assertFalse(relay_power['relay-b'])
+
+            # 5. Query resulting state afterward
+            scripted_calls.append({'id': 'c5', 'function': {'name': 'get_telemetry',
+                'arguments': json.dumps({'device_name': 'Simulated Tasmota A'})}})
+            r5 = await bridge.run_agent_chat(agent, bridge.AgentChatRequest(message='What is its current state?'))
+            state_res = json.loads(r5['tool_calls'][0]['result'])
+            self.assertEqual(state_res['telemetry']['POWER'][0]['value'], 'ON')
 
 
 if __name__ == '__main__':

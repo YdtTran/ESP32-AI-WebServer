@@ -5,7 +5,7 @@ import logging
 from typing import Any, Optional, Union
 
 from ..capabilities import CapabilityError
-from ..client import ThingsBoardError
+from ..client import DeviceNotFoundError, ThingsBoardError
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,9 @@ def register_capability_tools(mcp_server, client, registry):
                                     timeout_ms: int = 5000, two_way: bool = True) -> dict:
         """Execute a currently advertised device action after validating its parameters."""
         if not 1 <= timeout_ms <= 120000:
-            return {'success': False, 'error': 'Timeout must be between 1 and 120000 milliseconds.'}
+            return {'success': False, 'confirmed': False, 'delivery': 'failed',
+                    'error_code': 'invalid_params',
+                    'error': 'Timeout must be between 1 and 120000 milliseconds.'}
         try:
             async with lock:
                 await registry.refresh()
@@ -63,9 +65,30 @@ def register_capability_tools(mcp_server, client, registry):
                 registry.validate(device_id, method, value)
                 result = await client.send_rpc(device_id, method, value, timeout_ms, two_way)
             data = result.model_dump()
-            data['delivery'] = 'device_response' if two_way and result.success else 'submitted' if result.success else 'failed'
+            confirmed = bool(two_way and result.success and result.response not in (None, ''))
+            data['confirmed'] = confirmed
+            data['delivery'] = 'device_response' if confirmed else 'submitted' if result.success else 'failed'
+            if not result.success:
+                err_lower = (result.error or '').lower()
+                is_offline = ('offline' in err_lower or 'disconnected' in err_lower
+                              or ('timeout' in err_lower and any(
+                                  item.get('availability') == 'offline' for item in registry.list(device_id))))
+                data['error_code'] = (
+                    'device_offline' if is_offline
+                    else 'timeout' if ('timeout' in err_lower or 'timed out' in err_lower)
+                    else 'device_not_found' if ('not found' in err_lower or 'does not exist' in err_lower)
+                    else 'rpc_failed'
+                )
             return data
         except (ThingsBoardError, CapabilityError, ValueError) as exc:
-            return {'success': False, 'error': str(exc)}
+            msg = str(exc)
+            code = (
+                'device_not_found' if isinstance(exc, DeviceNotFoundError)
+                else 'invalid_params' if (isinstance(exc, CapabilityError) and 'Invalid parameters' in msg)
+                else 'unsupported_method' if isinstance(exc, CapabilityError)
+                else 'error'
+            )
+            return {'success': False, 'confirmed': False, 'delivery': 'failed',
+                    'error_code': code, 'error': msg}
 
     return execute_device_action

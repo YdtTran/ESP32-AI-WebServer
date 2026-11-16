@@ -1,7 +1,9 @@
-import unittest
+import json
+from pathlib import Path
 import tempfile
+import unittest
 
-from tools.tasmota_bridge import TasmotaBridge
+from tools.tasmota_bridge import TasmotaBridge, device_capabilities
 
 
 class TasmotaBridgeTests(unittest.TestCase):
@@ -99,6 +101,29 @@ class TasmotaBridgeTests(unittest.TestCase):
             second.request(request)
             self.assertEqual(len(self.sent), 1)
             self.assertIn('error', self.replies[-1]['data'])
+
+    def test_automatic_rpc_capabilities_for_configured_devices(self):
+        cfg = json.loads((Path(__file__).resolve().parents[1] / 'tools/tasmota-bridge.example.json').read_text())
+        caps_a = device_capabilities(cfg['devices']['relay-a'])
+        caps_b = device_capabilities(cfg['devices']['relay-b'])
+        self.assertEqual(set(caps_a['methods']), {'setPower', 'getPower', 'togglePower'})
+        self.assertEqual(set(caps_b['methods']), {'setPower', 'getPower'})
+        self.assertEqual(caps_a['methods']['setPower']['params']['properties']['state']['type'], 'boolean')
+        self.assertEqual(caps_a['methods']['getPower']['params']['properties'], {})
+
+    def test_mismatched_power_result_is_not_correlated_with_pending_command(self):
+        self.request(1, 'setPower', True)
+        # Stale OFF result must not satisfy pending POWER ON command.
+        self.bridge.result('relay-a', {'POWER': 'OFF'})
+        self.assertEqual(self.replies, [])
+        self.bridge.result('relay-a', {'POWER': 'ON'})
+        self.assertEqual(self.replies[-1], {'device': 'Relay A', 'id': 1, 'data': {'POWER': 'ON'}})
+        # Observed state is ON; toggling expects OFF and must ignore stale ON.
+        self.request(2, 'toggle', {})
+        self.bridge.result('relay-a', {'POWER': 'ON'})
+        self.assertEqual(len(self.replies), 1)
+        self.bridge.result('relay-a', {'POWER': 'OFF'})
+        self.assertEqual(self.replies[-1], {'device': 'Relay A', 'id': 2, 'data': {'POWER': 'OFF'}})
 
 
 if __name__ == '__main__':

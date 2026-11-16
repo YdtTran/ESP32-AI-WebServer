@@ -93,6 +93,13 @@ class TestThingsBoardConfig(unittest.TestCase):
                 resolve_thingsboard_config(profile_dict=no_auth_profile)
             self.assertIn("credentials not found in active Agent Profile", str(ctx.exception))
 
+    def test_profile_dict_does_not_leak_file_or_env_credentials(self):
+        incomplete_profile = {"id": "agent-incomplete", "integrations": {"thingsboard": {"host": "http://agent.test"}}}
+        with patch.dict(os.environ, {"TB_HOST": "http://env.test", "TB_API_KEY": "env-secret"}, clear=True):
+            with self.assertRaises(ValueError) as ctx:
+                resolve_thingsboard_config(profile_dict=incomplete_profile)
+            self.assertIn("credentials not found", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

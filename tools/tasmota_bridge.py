@@ -11,6 +11,42 @@ import time
 from .virtual_tasmota import mqtt_topic
 
 
+def device_capabilities(device):
+    """Build or return an explicit rpcCapabilities contract for a configured device."""
+    explicit = device.get('rpcCapabilities')
+    if isinstance(explicit, dict) and isinstance(explicit.get('methods'), dict):
+        return explicit
+    methods = {}
+    for method_name, mapping in (device.get('methods') or {}).items():
+        if not isinstance(mapping, dict):
+            continue
+        if isinstance(mapping.get('params'), dict):
+            schema = mapping['params']
+        elif isinstance(mapping.get('values'), dict):
+            allowed = [json.loads(key) for key in mapping['values']]
+            if allowed and all(isinstance(val, bool) for val in allowed):
+                val_schema = {'type': 'boolean'}
+            elif allowed and all(isinstance(val, int) and not isinstance(val, bool) for val in allowed):
+                val_schema = {'type': 'integer', 'enum': allowed}
+            elif allowed and all(isinstance(val, str) for val in allowed):
+                val_schema = {'type': 'string', 'enum': allowed}
+            else:
+                val_schema = {'enum': allowed}
+            if 'parameter' in mapping:
+                param = mapping['parameter']
+                schema = {'type': 'object', 'properties': {param: val_schema},
+                          'required': [param], 'additionalProperties': False}
+            else:
+                schema = val_schema
+        else:
+            schema = {'type': 'object', 'properties': {}, 'additionalProperties': False}
+        methods[method_name] = {
+            'description': mapping.get('description', f'{method_name} via Tasmota {mapping.get("command", "POWER")}'),
+            'params': schema,
+        }
+    return {'methods': methods}
+
+
 class TasmotaBridge:
     def __init__(self, devices, publish_command, publish_response, clock=time.monotonic, timeout=5, journal=None):
         self.devices = devices
@@ -21,7 +57,7 @@ class TasmotaBridge:
         self.journal = str(journal) if journal else None
         self.lock = threading.RLock()
         self.states = {topic: {'online': False, 'blocked': False, 'pending': None,
-                               'queue': deque(), 'seen': OrderedDict()} for topic in devices}
+                               'queue': deque(), 'seen': OrderedDict(), 'power': None} for topic in devices}
         self.by_name = {device['name']: topic for topic, device in devices.items()}
         if len(self.by_name) != len(devices):
             raise ValueError('ThingsBoard device names must be unique')
@@ -64,11 +100,23 @@ class TasmotaBridge:
             self._reply(topic, state['queue'].popleft()['id'], {'error': message})
         self._save(topic)
 
+    def capabilities(self, topic):
+        return device_capabilities(self.devices[topic])
+
+    def observe_state(self, topic, payload):
+        if not isinstance(payload, dict) or payload.get('POWER') not in ('ON', 'OFF'):
+            return
+        with self.lock:
+            state = self.states.get(topic)
+            if state is not None and state['pending'] is None:
+                state['power'] = payload['POWER']
+
     def set_online(self, topic, online):
         with self.lock:
             state = self.states[topic]
             state['online'] = online
             if not online:
+                state['power'] = None
                 self._fail_pending(topic, 'Device disconnected; command outcome is unknown')
 
     def request(self, message):
@@ -128,6 +176,16 @@ class TasmotaBridge:
             return
         request = state['queue'].popleft()
         request['deadline'] = self.clock() + self.timeout
+        if request['command'] == 'POWER':
+            cmd = str(request['payload']).strip().upper()
+            if cmd in ('ON', '1', 'TRUE'):
+                request['expected'] = 'ON'
+            elif cmd in ('OFF', '0', 'FALSE'):
+                request['expected'] = 'OFF'
+            elif cmd in ('TOGGLE', '2') and state.get('power') in ('ON', 'OFF'):
+                request['expected'] = 'OFF' if state['power'] == 'ON' else 'ON'
+            else:
+                request['expected'] = None
         state['pending'] = request
         self._save(topic)
         full_topic = self.devices[topic].get('full_topic', '%prefix%/%topic%/')
@@ -136,7 +194,11 @@ class TasmotaBridge:
     def result(self, topic, result):
         with self.lock:
             state = self.states[topic]
-            if state['pending'] is None or not isinstance(result, dict):
+            if not isinstance(result, dict):
+                return
+            if state['pending'] is None:
+                if result.get('POWER') in ('ON', 'OFF'):
+                    state['power'] = result['POWER']
                 return
             request = state['pending']
             if self.clock() >= request['deadline']:
@@ -144,6 +206,10 @@ class TasmotaBridge:
                 return
             if request['command'] not in result:
                 return
+            if request.get('expected') is not None and result.get(request['command']) != request['expected']:
+                return
+            if result.get('POWER') in ('ON', 'OFF'):
+                state['power'] = result['POWER']
             state['pending'] = None
             self._reply(topic, request['id'], result)
             self._start_next(topic)
@@ -198,8 +264,12 @@ def main():
                 bridge.set_online(topic, online)
                 publish_gateway('v1/gateway/connect' if online else 'v1/gateway/disconnect',
                                 {'device': device['name'], **({'type': device.get('type', 'default')} if online else {})})
+                if online:
+                    publish_gateway('v1/gateway/attributes', {device['name']: {'rpcCapabilities': bridge.capabilities(topic)}})
             elif kind == 'STATE':
-                publish_gateway('v1/gateway/telemetry', {device['name']: [json.loads(payload)]})
+                state_data = json.loads(payload)
+                bridge.observe_state(topic, state_data)
+                publish_gateway('v1/gateway/telemetry', {device['name']: [state_data]})
             else:
                 result = json.loads(payload)
                 publish_gateway('v1/gateway/telemetry', {device['name']: [result]})
@@ -215,6 +285,7 @@ def main():
             if state['online']:
                 device = devices[topic]
                 publish_gateway('v1/gateway/connect', {'device': device['name'], 'type': device.get('type', 'default')})
+                publish_gateway('v1/gateway/attributes', {device['name']: {'rpcCapabilities': bridge.capabilities(topic)}})
 
     def gateway_message(client, userdata, message):
         try:

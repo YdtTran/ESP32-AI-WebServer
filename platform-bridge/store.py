@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -68,7 +69,7 @@ DEFAULT_AGENTS = [
                 "host": os.getenv("THINGSBOARD_HOST", "https://codehelpers.tech"),
                 "api_key": os.getenv(
                     "THINGSBOARD_API_KEY",
-                    "tb_G5TSH2WJsF3g25Q_7jImZwyUpdAYqGtI6cT86c-dMCKy_d8WZ3M3rNjn9zhzOT5Y9AnvV-KKQPpIQChD7qPluA"
+                    ""
                 ),
                 "display_name": "CodeHelpers IoT Cloud",
                 "timeout_seconds": 10.0
@@ -114,7 +115,7 @@ DEFAULT_AGENTS = [
                 "host": os.getenv("THINGSBOARD_HOST", "https://codehelpers.tech"),
                 "api_key": os.getenv(
                     "THINGSBOARD_API_KEY",
-                    "tb_G5TSH2WJsF3g25Q_7jImZwyUpdAYqGtI6cT86c-dMCKy_d8WZ3M3rNjn9zhzOT5Y9AnvV-KKQPpIQChD7qPluA"
+                    ""
                 ),
                 "display_name": "CodeHelpers IoT Cloud (Read-Only)",
                 "timeout_seconds": 10.0
@@ -154,7 +155,7 @@ DEFAULT_AGENTS = [
                 "host": os.getenv("THINGSBOARD_HOST", "https://codehelpers.tech"),
                 "api_key": os.getenv(
                     "THINGSBOARD_API_KEY",
-                    "tb_G5TSH2WJsF3g25Q_7jImZwyUpdAYqGtI6cT86c-dMCKy_d8WZ3M3rNjn9zhzOT5Y9AnvV-KKQPpIQChD7qPluA"
+                    ""
                 ),
                 "display_name": "CodeHelpers IoT Cloud",
                 "timeout_seconds": 10.0
@@ -173,13 +174,22 @@ DEFAULT_AGENTS = [
 
 
 class PlatformStore:
-    def __init__(self):
+    def __init__(self, account_store=None, username=None):
+        self.account_store = account_store
+        self.username = username
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.agents: Dict[str, Dict[str, Any]] = {}
         self.device_to_agent: Dict[str, str] = {}
         self.load()
 
     def load(self):
+        if self.account_store is not None:
+            self.agents = {agent['id']: agent for agent in self.account_store.list_agents(self.username)}
+            self.device_to_agent = {
+                normalize_mac(device.get('mac', '')): agent_id
+                for agent_id, agent in self.agents.items() for device in agent.get('devices', [])
+            }
+            return
         if PROFILES_FILE.exists():
             try:
                 with open(PROFILES_FILE, "r", encoding="utf-8") as f:
@@ -202,7 +212,11 @@ class PlatformStore:
 
         logger.info("Loaded %d agent profile(s) and %d device binding(s)", len(self.agents), len(self.device_to_agent))
 
-    def save(self):
+    def save(self, agent_id=None):
+        if self.account_store is not None:
+            if agent_id is not None and agent_id in self.agents:
+                self.account_store.put_agent(self.username, self.agents[agent_id])
+            return
         try:
             with open(PROFILES_FILE, "w", encoding="utf-8") as f:
                 json.dump(list(self.agents.values()), f, ensure_ascii=False, indent=2)
@@ -236,6 +250,7 @@ class PlatformStore:
     def list_safe_agents(self) -> List[Dict[str, Any]]:
         """Formats agent profiles into complete console schema with masked API keys."""
         res = []
+        registered = device_db.list_authenticated_devices() if self.account_store is not None else []
         for agent in self.agents.values():
             raw_devices = agent.get("devices", [])
             devs = []
@@ -251,9 +266,13 @@ class PlatformStore:
                     "ota_enabled": True
                 })
 
+            for device in registered:
+                if device['agent_id'] == agent['id']:
+                    devs.append({**device, 'is_auth': True, 'ota_enabled': True})
+
             tb_cfg = agent.get("integrations", {}).get("thingsboard", {})
             masked_tb = {
-                "host": tb_cfg.get("host", "https://codehelpers.tech"),
+                "host": tb_cfg.get("host", ""),
                 "api_key": mask_api_key(tb_cfg.get("api_key")),
                 "display_name": tb_cfg.get("display_name", "ThingsBoard IoT"),
                 "is_configured": bool(tb_cfg.get("api_key")),
@@ -268,11 +287,11 @@ class PlatformStore:
                 "voice": agent.get("tts", {}).get("voice", "vi_female_linh"),
                 "status": agent.get("status", "online"),
                 "deviceCount": len(devs),
-                "onlineDeviceCount": len(devs),
+                "onlineDeviceCount": sum(1 for device in devs if device.get('status') == 'online'),
                 "lastSeen": "Just now",
                 "tool_policy": agent.get("tool_policy", "full_control"),
                 "devices": devs,
-                "chats": agent.get("chats", []),
+                "chats": agent.get('console_chats', []) + self.chat_sessions(agent),
                 "config": {
                     "language": agent.get("language", "vi"),
                     "ttsVoice": agent.get("tts", {}).get("voice", "vi_female_linh"),
@@ -313,7 +332,7 @@ class PlatformStore:
         tb_in = data.get("integrations", {}).get("thingsboard", {})
         integrations = {
             "thingsboard": {
-                "host": tb_in.get("host", "https://codehelpers.tech"),
+                "host": tb_in.get("host", ""),
                 "api_key": tb_in.get("api_key", ""),
                 "display_name": tb_in.get("display_name", "ThingsBoard IoT"),
                 "timeout_seconds": 10.0
@@ -341,11 +360,19 @@ class PlatformStore:
             "memories": []
         }
         self.agents[agent_id] = new_agent
-        self.save()
+        self.save(agent_id)
         return new_agent
 
     def update_agent(self, agent_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Updates an existing agent profile, preserving sensitive credentials if masked."""
+        if self.account_store is not None:
+            with self.account_store.edit_agent(self.username, agent_id) as agent:
+                self.agents[agent_id] = agent
+                self._apply_agent_update(agent_id, data, persist=False)
+            return agent
+        return self._apply_agent_update(agent_id, data)
+
+    def _apply_agent_update(self, agent_id: str, data: Dict[str, Any], persist=True) -> Dict[str, Any]:
         if agent_id not in self.agents:
             raise ValueError(f"Agent '{agent_id}' does not exist.")
 
@@ -356,6 +383,11 @@ class PlatformStore:
             agent["role"] = data["role"]
         if "tool_policy" in data:
             agent["tool_policy"] = data["tool_policy"]
+        if "chats" in data:
+            chats = data['chats']
+            if not isinstance(chats, list) or any(not isinstance(chat, dict) or not isinstance(chat.get('id'), str) or not isinstance(chat.get('messages'), list) for chat in chats):
+                raise ValueError('Invalid chat history')
+            agent['console_chats'] = [chat for chat in chats if not chat['id'].startswith('device:')]
 
         # Config fields (from ConfigModal or direct payload)
         cfg = data.get("config", {})
@@ -397,7 +429,9 @@ class PlatformStore:
             if raw_key and "..." not in raw_key and raw_key != "***":
                 existing_tb["api_key"] = raw_key.strip()
 
-        self.save()
+        if not persist:
+            return agent
+        self.save(agent_id)
         # Sync active profile to agent_profile.json
         try:
             self.sync_to_agent_profile_json(agent_id)
@@ -411,6 +445,8 @@ class PlatformStore:
         if agent_id not in self.agents:
             return
         del self.agents[agent_id]
+        if self.account_store is not None:
+            self.account_store.delete_agent(self.username, agent_id)
         # Rebuild device map
         self.device_to_agent = {
             mac: a_id for mac, a_id in self.device_to_agent.items() if a_id != agent_id
@@ -509,8 +545,27 @@ class PlatformStore:
         agent["devices"] = devices
 
         self.device_to_agent[norm] = agent_id
-        self.save()
+        self.save(agent_id)
         logger.info("Bound device %s to agent %s (%s)", norm, agent_id, device_name)
+
+    def chat_sessions(self, agent: Dict[str, Any]) -> List[Dict[str, Any]]:
+        sessions = {}
+        for index, entry in enumerate(agent.get("chats", [])):
+            if "session_id" not in entry:
+                continue
+            session_id = f"device:{entry.get('mac', '')}:{entry['session_id']}"
+            timestamp = entry.get("timestamp")
+            created = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)) if timestamp else ""
+            session = sessions.setdefault(session_id, {
+                "id": session_id, "title": entry.get("content", "")[:40],
+                "createdAt": created, "messageCount": 0, "messages": []
+            })
+            session["messages"].append({
+                "id": f"{session_id}:{index}", "role": entry.get("role", "user"),
+                "content": entry.get("content", ""), "createdAt": created
+            })
+            session["messageCount"] += 1
+        return list(reversed(list(sessions.values())))
 
     def record_chat(self, mac_address: str, session_id: str, chat_type: int, content: str):
         agent = self.get_agent_for_device(mac_address)
@@ -523,12 +578,12 @@ class PlatformStore:
             "mac": normalize_mac(mac_address),
             "role": role,
             "content": content,
-            "timestamp": int(os.environ.get("MOCK_TIMESTAMP", 0)) or None
+            "timestamp": int(os.environ.get("MOCK_TIMESTAMP", 0)) or int(time.time())
         })
         # Keep latest 50 messages
         if len(chats) > 50:
             agent["chats"] = chats[-50:]
-        self.save()
+        self.save(agent['id'])
 
     def sync_to_agent_profile_json(self, agent_id: str, output_path: str = "agent_profile.json"):
         """Exports the active Agent Profile into agent_profile.json for ThingsBoard MCP Server."""

@@ -117,19 +117,17 @@ class ThingsBoardTasmotaE2E(unittest.TestCase):
                          'configuration': {'timeoutInSeconds': 5}}],
                     'connections': [{'fromIndex': 0, 'toIndex': 1, 'type': 'Success'},
                                     {'fromIndex': 1, 'toIndex': 2, 'type': 'Success'}]})
-                capability = {'methods': {
-                    'setPower': {'description': 'Set relay power', 'params': {'type': 'object',
-                        'properties': {'state': {'type': 'boolean'}}, 'required': ['state'], 'additionalProperties': False}},
-                    'getPower': {'description': 'Read relay power', 'params': {'type': 'object',
-                        'properties': {}, 'additionalProperties': False}},
-                    'togglePower': {'description': 'Toggle relay power', 'params': {'type': 'object',
-                        'properties': {}, 'additionalProperties': False}},
-                }}
-                call('POST', f'/api/plugins/telemetry/DEVICE/{ids[0]}/attributes/SERVER_SCOPE',
-                     json={'rpcCapabilities': capability})
-                capability['methods'].pop('togglePower')
-                call('POST', f'/api/plugins/telemetry/DEVICE/{ids[1]}/attributes/SERVER_SCOPE',
-                     json={'rpcCapabilities': capability})
+                def wait_for_capabilities(device_id):
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
+                        attrs = call('GET', f'/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/CLIENT_SCOPE')
+                        if any(item.get('key') == 'rpcCapabilities' for item in attrs):
+                            return
+                        time.sleep(.5)
+                    self.fail('Bridge did not automatically register rpcCapabilities')
+
+                for device_id in ids:
+                    wait_for_capabilities(device_id)
                 direct = call('POST', f'/api/rpc/twoway/{ids[0]}',
                               json={'method': 'setPower', 'params': {'state': True}, 'timeout': 10000})
                 self.assertEqual(direct['POWER'], 'ON')
@@ -171,15 +169,28 @@ class ThingsBoardTasmotaE2E(unittest.TestCase):
                     agent_config = {'host': host, 'api_key': api_key['value']}
                     with patch.dict(os.environ, {'PLATFORM_DATA_DIR': temp}):
                         async with httpx.AsyncClient() as agent_http:
+                            listed = await agent_tools.execute(agent_http, agent_config, 'list_devices', {}, profile_id='agent-a')
+                            self.assertTrue(listed['success'])
+                            self.assertTrue(any(d['id'] == ids[0] for d in listed['devices']))
+                            caps_res = await agent_tools.execute(agent_http, agent_config, 'list_available_rpc',
+                                {'device_identifier': names[0]}, profile_id='agent-a')
+                            self.assertTrue(caps_res['success'])
+                            self.assertEqual({c['method'] for c in caps_res['capabilities']}, {'setPower', 'getPower', 'togglePower'})
+                            denied_b = await agent_tools.execute(agent_http, agent_config, 'execute_device_action',
+                                {'device_identifier': names[1], 'method': 'togglePower', 'params': {}}, profile_id='agent-a')
+                            self.assertFalse(denied_b['success'])
+                            self.assertEqual(denied_b['error_code'], 'unsupported_method')
                             denied = await agent_tools.execute(agent_http, agent_config, 'thingsboard_rpc',
                                 {'device_id': ids[0], 'method': 'invented', 'params': {}}, profile_id='agent-a')
                             self.assertFalse(denied['success'])
                             malformed = await agent_tools.execute(agent_http, agent_config, 'thingsboard_rpc',
                                 {'device_id': ids[0], 'method': 'setPower', 'params': {'state': 'yes'}}, profile_id='agent-a')
                             self.assertFalse(malformed['success'])
-                            permitted = await agent_tools.execute(agent_http, agent_config, 'thingsboard_rpc',
-                                {'device_id': ids[0], 'method': 'setPower', 'params': {'state': True}}, profile_id='agent-a')
+                            permitted = await agent_tools.execute(agent_http, agent_config, 'execute_device_action',
+                                {'device_identifier': names[0], 'method': 'setPower', 'params': {'state': True}}, profile_id='agent-a')
                             self.assertTrue(permitted['success'], permitted)
+                            self.assertTrue(permitted['confirmed'])
+                            self.assertEqual(permitted['delivery'], 'device_response')
                             self.assertEqual(permitted['data']['POWER'], 'ON')
                             call('PUT', f'/api/apiKey/{created_api_key}/enabled/false')
                             revoked = await agent_tools.execute(agent_http, agent_config, 'thingsboard_rpc',

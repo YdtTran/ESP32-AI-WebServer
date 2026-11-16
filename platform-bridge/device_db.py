@@ -4,7 +4,9 @@ Handles cryptographic token hashing, activation codes, rate-limiting,
 and authenticated hardware lifecycle tracking via SQLite.
 """
 
+from contextlib import contextmanager
 import hashlib
+import json
 import logging
 import os
 import secrets
@@ -33,10 +35,15 @@ class DeviceDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_connection(self):
         conn = sqlite3.connect(str(self.db_path), timeout=15.0)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
         with _lock, self._get_connection() as conn:
@@ -57,6 +64,8 @@ class DeviceDB:
             cols = [col[1] for col in conn.execute("PRAGMA table_info(activation_codes);").fetchall()]
             if "mac_address" not in cols:
                 conn.execute("ALTER TABLE activation_codes ADD COLUMN mac_address TEXT;")
+            if "enrollment_hash" not in cols:
+                conn.execute("ALTER TABLE activation_codes ADD COLUMN enrollment_hash TEXT;")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS devices (
                     device_id TEXT PRIMARY KEY,
@@ -72,6 +81,9 @@ class DeviceDB:
                     last_seen REAL NOT NULL
                 );
             """)
+            conn.execute("""CREATE TABLE IF NOT EXISTS legacy_device_archive (
+                device_id TEXT PRIMARY KEY, data TEXT NOT NULL
+            )""")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS registration_rate_limits (
                     identifier TEXT PRIMARY KEY,
@@ -130,17 +142,18 @@ class DeviceDB:
         expires_at = now + ttl_seconds
 
         with _lock, self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             # Generate unique code
             for _ in range(10):
                 code = f"{secrets.randbelow(1000000):06d}"
                 existing = conn.execute(
-                    "SELECT code FROM activation_codes WHERE code = ? AND expires_at > ?",
-                    (code, now)
+                    "SELECT code FROM activation_codes WHERE code = ?",
+                    (code,)
                 ).fetchone()
                 if not existing:
                     break
             else:
-                code = f"{secrets.randbelow(1000000):06d}"
+                raise RuntimeError('Unable to generate activation code')
 
             conn.execute("""
                 INSERT INTO activation_codes (code, agent_id, created_at, expires_at, status)
@@ -148,7 +161,7 @@ class DeviceDB:
             """, (code, agent_id, now, expires_at))
             conn.commit()
 
-        logger.info("Generated activation code %s for agent %s (expires in %ds)", code, agent_id, ttl_seconds)
+        logger.info("Generated activation code for agent %s (expires in %ds)", agent_id, ttl_seconds)
         return {
             "code": code,
             "agent_id": agent_id,
@@ -158,38 +171,40 @@ class DeviceDB:
             "status": "pending"
         }
 
-    def get_or_create_code_for_device(self, mac_address: str, ttl_seconds: int = 300) -> str:
+    def get_or_create_code_for_device(self, mac_address: str, ttl_seconds: int = 300, enrollment_hash: str = "") -> str:
         """Returns existing valid pending activation code for a MAC or generates a fresh one."""
         now = time.time()
         expires_at = now + ttl_seconds
         with _lock, self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("""
                 SELECT code FROM activation_codes
-                WHERE mac_address = ? AND status = 'pending' AND expires_at > ?
+                WHERE mac_address = ? AND status = 'pending' AND expires_at > ? AND enrollment_hash = ?
                 ORDER BY created_at DESC LIMIT 1
-            """, (mac_address, now)).fetchone()
+            """, (mac_address, now, enrollment_hash)).fetchone()
             if row:
                 return row["code"]
 
+            conn.execute("UPDATE activation_codes SET status = 'expired' WHERE mac_address = ? AND status = 'pending'", (mac_address,))
             # Generate unique 6-digit code
             for _ in range(10):
                 code = f"{secrets.randbelow(1000000):06d}"
                 existing = conn.execute(
-                    "SELECT code FROM activation_codes WHERE code = ? AND expires_at > ?",
-                    (code, now)
+                    "SELECT code FROM activation_codes WHERE code = ?",
+                    (code,)
                 ).fetchone()
                 if not existing:
                     break
             else:
-                code = f"{secrets.randbelow(1000000):06d}"
+                raise RuntimeError('Unable to generate activation code')
 
             conn.execute("""
-                INSERT INTO activation_codes (code, agent_id, mac_address, created_at, expires_at, status)
-                VALUES (?, '', ?, ?, ?, 'pending')
-            """, (code, mac_address, now, expires_at))
+                INSERT INTO activation_codes (code, agent_id, mac_address, created_at, expires_at, status, enrollment_hash)
+                VALUES (?, '', ?, ?, ?, 'pending', ?)
+            """, (code, mac_address, now, expires_at, enrollment_hash))
             conn.commit()
 
-        logger.info("Generated ESP32 activation code %s for hardware MAC %s", code, mac_address)
+        logger.info("Generated activation code for hardware MAC %s", mac_address)
         return code
 
     def is_device_activated(self, mac_address: str) -> bool:
@@ -208,10 +223,11 @@ class DeviceDB:
             ).fetchone()
             return dict(row) if row else None
 
-    def bind_device_by_code(self, code: str, agent_id: str, device_name: Optional[str] = None) -> Dict[str, Any]:
+    def bind_device_by_code(self, code: str, agent_id: str, device_name: Optional[str] = None, raw_token: Optional[str] = None, legacy_agent_id: Optional[str] = None) -> Dict[str, Any]:
         """User on console enters 6-digit code (spoken/printed by ESP32) and binds to selected Agent."""
         now = time.time()
         with _lock, self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM activation_codes WHERE code = ?", (code,)).fetchone()
             if not row:
                 raise ValueError("Invalid activation code.")
@@ -224,13 +240,22 @@ class DeviceDB:
                 conn.commit()
                 raise ValueError("Activation code has expired.")
 
+            if row['agent_id'] and row['agent_id'] != agent_id:
+                raise ValueError('Invalid activation code.')
             mac_address = row["mac_address"]
             if not mac_address:
                 # If code was generated from web without device MAC, generate virtual node MAC
                 mac_address = f"30:ED:A0:{code[:2]}:{code[2:4]}:{code[4:6]}"
 
+            existing = conn.execute("SELECT * FROM devices WHERE mac_address = ?", (mac_address,)).fetchone()
+            if existing:
+                if existing['status'] == 'active' and existing['agent_id'] not in (agent_id, legacy_agent_id):
+                    raise ValueError('Device is already bound.')
+                conn.execute('INSERT OR IGNORE INTO legacy_device_archive VALUES (?, ?)',
+                             (existing['device_id'], json.dumps(dict(existing))))
+
             device_id = f"dev_{secrets.token_hex(6)}"
-            raw_token = secrets.token_urlsafe(32)
+            raw_token = raw_token or secrets.token_urlsafe(32)
             token_digest = hash_token(raw_token)
             assigned_name = device_name or f"ESP32 ({mac_address[-5:]})"
 
@@ -258,7 +283,7 @@ class DeviceDB:
             """, (agent_id, device_id, now, code))
             conn.commit()
 
-        logger.info("Successfully activated device %s (MAC: %s) with agent %s via code %s", device_id, mac_address, agent_id, code)
+        logger.info("Successfully activated device %s (MAC: %s) with agent %s", device_id, mac_address, agent_id)
         return {
             "device_id": device_id,
             "device_token": raw_token,
@@ -267,6 +292,19 @@ class DeviceDB:
             "device_name": assigned_name,
             "status": "active"
         }
+
+    def enrollment_record(self, code: str):
+        with _lock, self._get_connection() as conn:
+            row = conn.execute('SELECT * FROM activation_codes WHERE code = ?', (code,)).fetchone()
+            return dict(row) if row else None
+
+    def redeemed_enrollment(self, mac_address: str, enrollment_hash: str):
+        with _lock, self._get_connection() as conn:
+            row = conn.execute("""SELECT d.* FROM activation_codes c JOIN devices d ON d.device_id = c.redeemed_by_device_id
+                WHERE c.mac_address = ? AND c.enrollment_hash = ? AND c.status = 'redeemed'
+                AND c.expires_at > ? AND d.status = 'active' ORDER BY c.redeemed_at DESC LIMIT 1""",
+                (mac_address, enrollment_hash, time.time())).fetchone()
+            return dict(row) if row else None
 
     def get_activation_status(self, code: str) -> Dict[str, Any]:
         now = time.time()
@@ -308,11 +346,13 @@ class DeviceDB:
         mac_address: str,
         device_name: Optional[str] = None,
         hardware_model: str = "ESP32-S3",
-        firmware_version: str = "v2.1.8"
+        firmware_version: str = "v2.1.8",
+        legacy_agent_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Validates code, creates device record, and returns plaintext token (only once)."""
         now = time.time()
         with _lock, self._get_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM activation_codes WHERE code = ?", (code,)).fetchone()
             if not row:
                 raise ValueError("Invalid activation code.")
@@ -326,6 +366,13 @@ class DeviceDB:
                 raise ValueError("Activation code has expired.")
 
             agent_id = row["agent_id"]
+
+            existing = conn.execute("SELECT * FROM devices WHERE mac_address = ?", (mac_address,)).fetchone()
+            if existing:
+                if existing['status'] == 'active' and existing['agent_id'] not in (agent_id, legacy_agent_id):
+                    raise ValueError('Device is already bound.')
+                conn.execute('INSERT OR IGNORE INTO legacy_device_archive VALUES (?, ?)',
+                             (existing['device_id'], json.dumps(dict(existing))))
 
             # Generate high-entropy token and device id
             device_id = f"dev_{secrets.token_hex(6)}"
@@ -416,6 +463,12 @@ class DeviceDB:
             )
             conn.commit()
             return cursor.rowcount > 0
+
+    def revoke_agent_devices(self, agent_id: str):
+        with _lock, self._get_connection() as conn:
+            conn.execute("UPDATE devices SET status = 'revoked', online_status = 'offline' WHERE agent_id = ?", (agent_id,))
+            conn.execute("UPDATE activation_codes SET status = 'expired' WHERE agent_id = ? AND status = 'pending'", (agent_id,))
+            conn.commit()
 
     def unbind_device_by_identifier(self, identifier: str) -> bool:
         """Unbinds and revokes credentials by device_id or mac_address."""
