@@ -1,8 +1,26 @@
 """Simulate a single Tasmota relay over MQTT."""
 
 import json
+import math
 import os
 import time
+
+
+def timing_configuration(environment):
+    delay = float(environment.get('TASMOTA_RESPONSE_DELAY', '0'))
+    disconnect_after = float(environment.get('TASMOTA_DISCONNECT_AFTER', '0'))
+    disconnect_duration = float(environment.get('TASMOTA_DISCONNECT_DURATION', '0'))
+    if (not all(math.isfinite(value) and value >= 0 for value in (delay, disconnect_after, disconnect_duration))
+            or bool(disconnect_after) != bool(disconnect_duration)):
+        raise ValueError('Invalid simulator timing configuration')
+    return delay, disconnect_after, disconnect_duration
+
+
+def mqtt_topic(full_topic, device, prefix, suffix):
+    if (full_topic.count('%prefix%') != 1 or full_topic.count('%topic%') != 1
+            or any(c in full_topic + device for c in '+#') or not device or '/' in device):
+        raise ValueError('Invalid MQTT FullTopic or device topic')
+    return full_topic.replace('%prefix%', prefix).replace('%topic%', device).rstrip('/') + '/' + suffix
 
 
 def power_command(payload, power):
@@ -25,12 +43,12 @@ def main():
     port = int(os.environ.get('MQTT_PORT', '1883'))
     prefix = os.environ.get('TASMOTA_PREFIX', '').strip('/')
     device = os.environ.get('TASMOTA_TOPIC', 'virtual-tasmota')
-    if '/' in device or not device or any(c in prefix + device for c in '+#'):
-        raise ValueError('Invalid MQTT topic')
     root = f'{prefix}/' if prefix else ''
-    command_topic = f'{root}cmnd/{device}/POWER'
-    status_topic = f'{root}stat/{device}'
-    telemetry_topic = f'{root}tele/{device}'
+    full_topic = os.environ.get('TASMOTA_FULL_TOPIC', f'{root}%prefix%/%topic%/')
+    response_delay, disconnect_after, disconnect_duration = timing_configuration(os.environ)
+    command_topic = mqtt_topic(full_topic, device, 'cmnd', 'POWER')
+    status_topic = mqtt_topic(full_topic, device, 'stat', '').rstrip('/')
+    telemetry_topic = mqtt_topic(full_topic, device, 'tele', '').rstrip('/')
     state = {'power': False}
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     if os.environ.get('MQTT_USERNAME'):
@@ -52,6 +70,8 @@ def main():
         print(f'Virtual relay connected: {command_topic}', flush=True)
 
     def on_message(client, userdata, message):
+        if response_delay:
+            time.sleep(response_delay)
         try:
             state['power'] = power_command(message.payload.decode('utf-8'), state['power'])
         except (ValueError, UnicodeDecodeError):
@@ -65,9 +85,22 @@ def main():
     client.connect(host, port, keepalive=60)
     client.loop_start()
     try:
+        next_telemetry = 0
+        next_disconnect = time.monotonic() + disconnect_after if disconnect_after else None
         while True:
-            client.publish(f'{telemetry_topic}/STATE', json.dumps({'POWER': 'ON' if state['power'] else 'OFF'}))
-            time.sleep(30)
+            now = time.monotonic()
+            if next_disconnect is not None and now >= next_disconnect:
+                client.publish(f'{telemetry_topic}/LWT', 'Offline', retain=True).wait_for_publish(timeout=5)
+                client.disconnect()
+                client.loop_stop()
+                time.sleep(disconnect_duration)
+                client.reconnect()
+                client.loop_start()
+                next_disconnect = time.monotonic() + disconnect_after
+            if now >= next_telemetry:
+                client.publish(f'{telemetry_topic}/STATE', json.dumps({'POWER': 'ON' if state['power'] else 'OFF'}))
+                next_telemetry = time.monotonic() + 30
+            time.sleep(0.1)
     except KeyboardInterrupt:
         client.publish(f'{telemetry_topic}/LWT', 'Offline', retain=True).wait_for_publish(timeout=5)
     finally:

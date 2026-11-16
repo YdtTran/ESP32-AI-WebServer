@@ -1,0 +1,65 @@
+services:
+  mqtt:
+    image: eclipse-mosquitto:2
+    entrypoint: ["/bin/sh", "/config/entrypoint.sh"]
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME:?Set MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?Set MQTT_PASSWORD}
+    volumes:
+      - ./tools/mosquitto-entrypoint.sh:/config/entrypoint.sh:ro
+    restart: unless-stopped
+
+  tasmota-a:
+    build:
+      context: .
+      dockerfile: tools/tasmota-simulator.Dockerfile
+    environment: &simulator-env
+      MQTT_HOST: mqtt
+      MQTT_USERNAME: ${MQTT_USERNAME:?Set MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?Set MQTT_PASSWORD}
+      TASMOTA_TOPIC: relay-a
+      TASMOTA_FULL_TOPIC: ${TASMOTA_FULL_TOPIC:-%prefix%/%topic%/}
+      TASMOTA_RESPONSE_DELAY: ${TASMOTA_RESPONSE_DELAY:-0}
+      TASMOTA_DISCONNECT_AFTER: ${TASMOTA_DISCONNECT_AFTER:-0}
+      TASMOTA_DISCONNECT_DURATION: ${TASMOTA_DISCONNECT_DURATION:-0}
+    depends_on:
+      - mqtt
+    restart: unless-stopped
+
+  tasmota-b:
+    build:
+      context: .
+      dockerfile: tools/tasmota-simulator.Dockerfile
+    environment:
+      <<: *simulator-env
+      TASMOTA_TOPIC: relay-b
+    depends_on:
+      - mqtt
+    restart: unless-stopped
+
+  thingsboard-bridge:
+    profiles: ["thingsboard"]
+    build:
+      context: .
+      dockerfile: tools/tasmota-bridge.Dockerfile
+    environment:
+      MQTT_HOST: mqtt
+      MQTT_USERNAME: ${MQTT_USERNAME:?Set MQTT_USERNAME}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?Set MQTT_PASSWORD}
+      TB_MQTT_HOST: ${TB_MQTT_HOST:-host.docker.internal}
+      TB_MQTT_PORT: ${TB_MQTT_PORT:-1883}
+      TB_GATEWAY_TOKEN: ${TB_GATEWAY_TOKEN:-}
+      TASMOTA_BRIDGE_CONFIG: /config/devices.json
+      TASMOTA_RPC_TIMEOUT: ${TASMOTA_RPC_TIMEOUT:-5}
+      TASMOTA_BRIDGE_DB: /data/bridge.sqlite3
+    volumes:
+      - ${TASMOTA_BRIDGE_CONFIG:-./tools/tasmota-bridge.example.json}:/config/devices.json:ro
+      - tasmota-bridge-data:/data
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      - mqtt
+    restart: unless-stopped
+
+volumes:
+  tasmota-bridge-data:

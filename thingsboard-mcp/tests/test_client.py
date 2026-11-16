@@ -40,6 +40,16 @@ class TestThingsBoardClient(unittest.IsolatedAsyncioTestCase):
         headers = client._get_headers()
         self.assertEqual(headers["X-Authorization"], "Bearer mock_jwt_token")
 
+    @patch('httpx.AsyncClient.post')
+    async def test_resolve_dashboard_filter_uses_single_sorted_entity_query(self, mock_post):
+        mock_post.return_value = httpx.Response(200, json={'data': [{'entityId': {
+            'entityType': 'DEVICE', 'id': 'device-1'}}]}, request=httpx.Request('POST', 'http://tb-mock.test'))
+        result = await self.client.resolve_alias_filter({'type': 'deviceType', 'deviceTypes': ['relay']})
+        self.assertEqual(result, 'device-1')
+        query = mock_post.await_args.kwargs['json']
+        self.assertEqual(query['pageLink']['pageSize'], 1)
+        self.assertEqual(query['pageLink']['sortOrder']['key']['key'], 'createdTime')
+
     @patch("httpx.AsyncClient.get")
     async def test_list_devices_success(self, mock_get):
         mock_response = httpx.Response(
@@ -78,6 +88,15 @@ class TestThingsBoardClient(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.devices[1].is_gateway)
 
     @patch("httpx.AsyncClient.get")
+    async def test_list_devices_with_customer_api_key(self, mock_get):
+        def response(status, data):
+            return httpx.Response(status, json=data, request=httpx.Request('GET', 'http://tb-mock.test'))
+        mock_get.side_effect = [response(403, {}), response(200, {'authority': 'CUSTOMER_USER', 'customerId': {'id': '11111111-2222-3333-4444-555555555555'}}), response(200, {'data': [{'id': {'id': 'device-id'}, 'name': 'sensor1'}], 'hasNext': False})]
+        result = await self.client.list_devices()
+        self.assertEqual(result.devices[0].name, 'sensor1')
+        self.assertIn('/api/customer/11111111-2222-3333-4444-555555555555/devices', mock_get.await_args.args[0])
+
+    @patch("httpx.AsyncClient.get")
     async def test_list_devices_auth_error(self, mock_get):
         mock_response = httpx.Response(
             status_code=401,
@@ -88,6 +107,12 @@ class TestThingsBoardClient(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ThingsBoardAuthError):
             await self.client.list_devices()
+
+    @patch("httpx.AsyncClient.get")
+    async def test_resolve_device_uuid_fails_closed_on_network_error(self, mock_get):
+        mock_get.side_effect = httpx.ConnectError('network unavailable')
+        with self.assertRaises(ThingsBoardError):
+            await self.client.resolve_device('11111111-2222-3333-4444-555555555555')
 
     @patch.object(ThingsBoardClient, "list_devices")
     async def test_resolve_device_by_name(self, mock_list_devices):
@@ -109,6 +134,26 @@ class TestThingsBoardClient(unittest.IsolatedAsyncioTestCase):
         dev_id, dev_name = await self.client.resolve_device("virtual-environmental-monitor")
         self.assertEqual(dev_id, "11111111-2222-3333-4444-555555555555")
         self.assertEqual(dev_name, "Virtual-Environmental-Monitor")
+
+    @patch.object(ThingsBoardClient, "list_devices")
+    async def test_resolve_device_on_later_page_by_label(self, mock_list_devices):
+        from src.schemas import ListDevicesResult, DeviceSummary
+        mock_list_devices.side_effect = [
+            ListDevicesResult(total_devices=0, page=0, has_next=True, devices=[]),
+            ListDevicesResult(total_devices=1, page=1, has_next=False, devices=[
+                DeviceSummary(id="sensor-id", name="sensor1", type="sensor", label="Garden sensor")
+            ]),
+        ]
+        self.assertEqual(await self.client.resolve_device("Garden sensor"), ("sensor-id", "sensor1"))
+        self.assertEqual(mock_list_devices.await_count, 2)
+
+    @patch.object(ThingsBoardClient, "resolve_device", new_callable=AsyncMock)
+    @patch("httpx.AsyncClient.post")
+    async def test_oneway_rpc_accepts_no_content(self, mock_post, mock_resolve):
+        mock_resolve.return_value = ("device-id", "Relay")
+        mock_post.return_value = httpx.Response(204, request=httpx.Request("POST", "http://tb-mock.test"))
+        result = await self.client.send_rpc("Relay", "setPower", True, two_way=False)
+        self.assertTrue(result.success)
 
     @patch.object(ThingsBoardClient, "list_devices")
     async def test_resolve_device_not_found(self, mock_list_devices):
@@ -167,6 +212,16 @@ class TestThingsBoardClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.method, "setGpio")
         self.assertEqual(res.response, {"result": "ok", "state": True})
         self.assertIsNone(res.error)
+
+    @patch.object(ThingsBoardClient, "resolve_device")
+    @patch("httpx.AsyncClient.post")
+    async def test_device_rpc_error_is_not_reported_as_success(self, mock_post, mock_resolve):
+        mock_resolve.return_value = ("11111111-2222-3333-4444-555555555555", "Relay")
+        mock_post.return_value = httpx.Response(200, json={"error": "Invalid command"},
+                                                request=httpx.Request("POST", "http://tb-mock.test"))
+        result = await self.client.send_rpc("Relay", "switch", True)
+        self.assertFalse(result.success)
+        self.assertIn("Invalid command", result.error)
 
     @patch.object(ThingsBoardClient, "resolve_device")
     @patch("httpx.AsyncClient.post")

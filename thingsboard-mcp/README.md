@@ -55,7 +55,7 @@ The server dynamically resolves ThingsBoard settings using the following lookup 
   "integrations": {
     "thingsboard": {
       "host": "http://localhost:8080",
-      "api_key": "tb_963y36TYm3j5OwJjAbPiZIifTCHTMB0WBZVstE9DVa9pjN4dB-jK_7gfTAQtm_PczbuaCkqq-e-AuwXNW-kIyQ",
+      "api_key": "",
       "timeout_seconds": 10
     }
   }
@@ -123,6 +123,9 @@ Fetches the latest telemetry readings for a device. Supports both device UUIDs a
 
 ### 3. `send_rpc`
 Sends a server-side Remote Procedure Call (RPC) to control an edge device (e.g., toggling GPIOs, rebooting, or changing operating parameters).
+The method must be currently discovered for that device and its parameter schema
+must validate. The low-level `ThingsBoardClient.send_rpc` remains available to
+trusted application code; the MCP tool cannot bypass capability checks.
 
 - **Parameters:**
   - `device_identifier` *(string, required)*: Device display name or UUID.
@@ -141,6 +144,7 @@ Sends a server-side Remote Procedure Call (RPC) to control an edge device (e.g.,
     "error": null
   }
   ```
+
 - **Example Response (Timeout / Device Offline):**
   ```json
   {
@@ -153,23 +157,40 @@ Sends a server-side Remote Procedure Call (RPC) to control an edge device (e.g.,
   }
   ```
 
+### Capability tools
+
+- `discover_capabilities` refreshes the read-only registry.
+- `list_available_rpc` lists methods for a device, including incomplete schemas.
+- `get_platform_summary` lists accessible devices and discovered actions.
+- `execute_device_action` refreshes, validates, and dispatches a registered
+  action. A one-way response marked `submitted` confirms submission only.
+
+The registry is stored in `TB_CAPABILITY_DB` (default `capabilities.sqlite3`)
+and isolated by integration credentials and profile. Device attributes,
+supported dashboard widgets and explicit rule-node declarations supply its
+metadata. See [the Tasmota and RPC contract](../docs/thingsboard-rpc-contract.md)
+for the declaration format, current discovery limits, simulator setup and
+end-to-end test instructions.
+
 ---
 
 ## 4. Running the MCP Server
 
 ### Option A: Via Local Docker Container (Recommended)
-Reuse the installed local Docker image (`iot_assignment-tools:latest`):
+Build the service image, which installs the dependencies from `requirements.txt`:
 
 ```bash
 # Run over stdio transport
-docker run -i --rm --network host \
-  -v $(pwd):/app -w /app \
-  iot_assignment-tools:latest \
-  python -m src.server --profile agent_profile.example.json
+docker compose build
+docker compose run --rm -i --no-deps thingsboard-mcp --transport stdio
 
 # Run as SSE network service on port 8009
 docker compose up -d
 ```
+
+The Compose service binds port 8009 to localhost and uses one configured profile.
+Its network transport has no per-client authentication; run separate isolated
+instances and an authenticated gateway if remote access is required.
 
 ### Option B: Local Python Environment
 ```bash
@@ -187,17 +208,16 @@ python -m src.server --profile agent_profile.example.json --transport sse --port
 ## 5. Testing & Verification
 
 ### 1. Run Unit & Mocked Protocol Tests
-Runs 24 unit and protocol tests covering configuration resolution, API mocking, and stdio IPC lifecycle:
+Runs unit and protocol tests covering configuration resolution, API mocking, and stdio IPC lifecycle:
 
 ```bash
-docker run --rm -v $(pwd):/app -w /app iot_assignment-tools:latest \
-  python -m unittest discover -s tests -p "test_*.py" -v
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ### 2. Run Live End-to-End Test Against ThingsBoard
-Connects an MCP client session over stdio, performs tool discovery, and calls all three tools against the running ThingsBoard instance:
+Connects an MCP client session over stdio and performs read-only device,
+telemetry and capability discovery against the running ThingsBoard instance:
 
 ```bash
-docker run --rm --network host -v $(pwd):/app -w /app iot_assignment-tools:latest \
-  python tests/test_live.py agent_profile.example.json
+python tests/test_live.py agent_profile.example.json
 ```

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import re
+import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 import httpx
 
@@ -105,6 +106,16 @@ class ThingsBoardClient:
             except httpx.RequestError as e:
                 raise ThingsBoardError(f"Network error querying devices: {e}")
 
+            if resp.status_code == 403:
+                try:
+                    identity = await client.get(f"{self.host}/api/auth/user", headers=self._get_headers())
+                    identity.raise_for_status()
+                    user = identity.json()
+                    if user.get("authority") == "CUSTOMER_USER":
+                        customer_id = str(uuid.UUID(user["customerId"]["id"]))
+                        resp = await client.get(f"{self.host}/api/customer/{customer_id}/devices", params=params, headers=self._get_headers())
+                except (httpx.HTTPError, KeyError, TypeError, ValueError) as e:
+                    raise ThingsBoardAuthError(f"Cannot resolve customer access: {e}") from e
             if resp.status_code == 401:
                 raise ThingsBoardAuthError("Unauthorized: ThingsBoard API key or token is invalid.")
             if resp.status_code != 200:
@@ -143,6 +154,84 @@ class ThingsBoardClient:
                 devices=devices,
             )
 
+    async def get_device_attributes(self, device_id: str) -> Dict[str, Any]:
+        """Read explicit device capabilities without invoking device RPC."""
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            await self.ensure_authenticated(client)
+            attributes = {}
+            for scope in ('CLIENT_SCOPE', 'SHARED_SCOPE', 'SERVER_SCOPE'):
+                url = f"{self.host}/api/plugins/telemetry/DEVICE/{device_id}/values/attributes/{scope}"
+                try:
+                    response = await client.get(url, headers=self._get_headers())
+                    if response.status_code == 403:
+                        continue
+                    response.raise_for_status()
+                except httpx.HTTPError as exc:
+                    raise ThingsBoardError(f"Could not read device attributes: {exc}") from exc
+                attributes[scope] = {item['key']: item.get('value') for item in response.json()}
+            return attributes
+
+    async def get_configuration_sources(self):
+        """Read accessible dashboards and rule-chain metadata, including all pages."""
+        sources = []
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            await self.ensure_authenticated(client)
+            headers = self._get_headers()
+
+            async def get(path, params=None):
+                try:
+                    response = await client.get(self.host + path, headers=headers, params=params)
+                    if response.status_code == 403:
+                        return None
+                    response.raise_for_status()
+                    return response.json()
+                except httpx.HTTPError as exc:
+                    raise ThingsBoardError(f"Could not read ThingsBoard configuration: {exc}") from exc
+
+            for kind, path in (('dashboard', '/api/tenant/dashboards'), ('rulechain', '/api/ruleChains')):
+                page = 0
+                while True:
+                    listing = await get(path, {'pageSize': 100, 'page': page})
+                    if listing is None and kind == 'dashboard' and page == 0:
+                        identity = await get('/api/auth/user')
+                        if identity and identity.get('authority') == 'CUSTOMER_USER':
+                            customer_id = str(uuid.UUID(identity['customerId']['id']))
+                            path = f'/api/customer/{customer_id}/dashboards'
+                            listing = await get(path, {'pageSize': 100, 'page': page})
+                    if listing is None:
+                        break
+                    for item in listing.get('data', []):
+                        identifier = str(uuid.UUID(item['id']['id']))
+                        detail_path = (f'/api/dashboard/{identifier}' if kind == 'dashboard'
+                                       else f'/api/ruleChain/{identifier}/metadata')
+                        detail = await get(detail_path)
+                        if detail is not None:
+                            sources.append((f'{kind}:{identifier}', detail))
+                    if not listing.get('hasNext'):
+                        break
+                    page += 1
+        return sources
+
+    async def resolve_alias_filter(self, entity_filter):
+        """Resolve the dashboard's default target using its read-only entity query."""
+        query = {'entityFilter': entity_filter,
+                 'pageLink': {'pageSize': 1, 'page': 0, 'sortOrder': {
+                     'key': {'type': 'ENTITY_FIELD', 'key': 'createdTime'}, 'direction': 'DESC'}},
+                 'entityFields': [{'type': 'ENTITY_FIELD', 'key': 'name'}]}
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            await self.ensure_authenticated(client)
+            try:
+                response = await client.post(f'{self.host}/api/entitiesQuery/find', json=query,
+                                             headers=self._get_headers())
+                if response.status_code == 403:
+                    return None
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise ThingsBoardError(f'Could not resolve dashboard alias: {exc}') from exc
+            items = response.json().get('data', [])
+            entity = items[0].get('entityId', {}) if items else {}
+            return entity.get('id') if entity.get('entityType') == 'DEVICE' else None
+
     async def resolve_device(self, identifier: str) -> Tuple[str, str]:
         """
         Resolve device identifier (UUID or device name) to a (device_id, device_name) tuple.
@@ -161,14 +250,22 @@ class ThingsBoardClient:
                     elif resp.status_code == 404:
                         raise DeviceNotFoundError(f"Device UUID '{clean_id}' does not exist on ThingsBoard.")
                 except httpx.RequestError as e:
-                    logger.warning("Could not verify device UUID '%s': %s. Using provided UUID.", clean_id, e)
-                    return clean_id, clean_id
+                    raise ThingsBoardError(f"Could not verify device UUID '{clean_id}': {e}") from e
 
-        # Search device by name
-        res = await self.list_devices(page_size=100, page=0)
-        for dev in res.devices:
-            if dev.name.lower() == clean_id.lower() or dev.id == clean_id:
-                return dev.id, dev.name
+        # Search every page so authorized devices beyond the first page remain accessible.
+        page = 0
+        matches = []
+        while True:
+            res = await self.list_devices(page_size=100, page=page)
+            matches.extend(dev for dev in res.devices if clean_id.casefold() in
+                           (dev.name.casefold(), (dev.label or "").casefold(), dev.id.casefold()))
+            if not res.has_next:
+                break
+            page += 1
+        if len(matches) == 1:
+            return matches[0].id, matches[0].name
+        if len(matches) > 1:
+            raise ThingsBoardError(f"Device '{identifier}' matches multiple devices; use a device ID.")
 
         raise DeviceNotFoundError(
             f"Device '{identifier}' not found in ThingsBoard tenant devices."
@@ -331,13 +428,17 @@ class ThingsBoardClient:
                     error=f"RPC timeout: Device '{device_name}' did not respond within {timeout_ms}ms.",
                 )
 
-            if resp.status_code in (200, 201):
+            if resp.status_code in (200, 201, 204):
                 resp_payload = None
                 if resp.text:
                     try:
                         resp_payload = resp.json()
                     except Exception:
                         resp_payload = resp.text
+                if two_way and isinstance(resp_payload, dict) and resp_payload.get('error'):
+                    return SendRpcResult(success=False, device_id=device_id, device_name=device_name,
+                                         method=method, response=resp_payload,
+                                         error=f"Device RPC error: {resp_payload['error']}")
                 return SendRpcResult(
                     success=True,
                     device_id=device_id,

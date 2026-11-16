@@ -15,6 +15,7 @@ except (ImportError, ModuleNotFoundError):
     from mcp.server.fastmcp import FastMCP as MCPServer
 
 from .client import ThingsBoardClient
+from .capabilities import CapabilityRegistry
 from .config import ThingsBoardConfig, resolve_thingsboard_config
 from .tools import register_all_tools
 
@@ -46,8 +47,9 @@ def create_server(
     mcp_server = MCPServer(server_name)
 
     # Register modular tools
-    register_all_tools(mcp_server, client)
-    logger.info("Initialized ThingsBoard MCP Server with tools: list_devices, get_telemetry, send_rpc")
+    registry = CapabilityRegistry(client, os.getenv('TB_CAPABILITY_DB', 'capabilities.sqlite3'))
+    register_all_tools(mcp_server, client, registry)
+    logger.info("Initialized ThingsBoard MCP Server with capability-aware tools")
     return mcp_server
 
 

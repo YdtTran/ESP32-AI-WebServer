@@ -29,6 +29,7 @@ class TestThingsBoardConfig(unittest.TestCase):
         self.assertEqual(cfg.host, "http://192.168.1.100:8080")
         self.assertEqual(cfg.api_key, "tb_test_key_12345")
         self.assertEqual(cfg.timeout_seconds, 15.0)
+        self.assertEqual(cfg.profile_id, 'agent_test')
 
     def test_resolve_from_nested_config_profile_dict(self):
         profile = {

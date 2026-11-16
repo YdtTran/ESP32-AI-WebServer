@@ -2,10 +2,10 @@
 """
 Interactive / End-to-End Live Verification Script for ThingsBoard MCP Server.
 Connects an MCP client to the ThingsBoard MCP Server over stdio,
-resolves credentials from active Agent Profile, and invokes all three tools:
+resolves credentials from the active Agent Profile, and performs read-only checks:
 1. list_devices
 2. get_telemetry
-3. send_rpc
+3. discover_capabilities
 """
 
 import asyncio
@@ -70,20 +70,12 @@ async def run_live_test(profile_path: str = "agent_profile.example.json"):
             telem_text = telem_res.content[0].text
             print(f"  Output:\n{telem_text}\n")
 
-            # Test Tool 3: send_rpc
-            print(f"[6/6] Calling Tool 3: 'send_rpc' for '{target_device}' (timeout: 2000ms)...")
-            rpc_res = await session.call_tool("send_rpc", {
-                "device_identifier": target_device,
-                "method": "getGpioStatus",
-                "params": {"pin": 1},
-                "timeout_ms": 2000,
-                "two_way": True
-            })
-            rpc_text = rpc_res.content[0].text
-            print(f"  Output:\n{rpc_text}\n")
+            print("[6/6] Calling 'discover_capabilities' without executing RPC...")
+            discovered = await session.call_tool("discover_capabilities", {})
+            print(f"  Output:\n{discovered.content[0].text}\n")
 
     print("=" * 65)
-    print("Verification completed successfully!")
+    print("Read-only checks completed; inspect the output for errors.")
     print("=" * 65)
 
 

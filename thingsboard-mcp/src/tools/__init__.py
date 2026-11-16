@@ -7,10 +7,12 @@ from ..client import ThingsBoardClient
 from .devices import register_list_devices_tool
 from .telemetry import register_get_telemetry_tool
 from .rpc import register_send_rpc_tool
+from .capabilities import register_capability_tools
 
 
-def register_all_tools(mcp_server, client: ThingsBoardClient) -> None:
+def register_all_tools(mcp_server, client: ThingsBoardClient, registry) -> None:
     """Register all ThingsBoard tools with the MCP Server instance."""
     register_list_devices_tool(mcp_server, client)
     register_get_telemetry_tool(mcp_server, client)
-    register_send_rpc_tool(mcp_server, client)
+    execute = register_capability_tools(mcp_server, client, registry)
+    register_send_rpc_tool(mcp_server, client, execute)

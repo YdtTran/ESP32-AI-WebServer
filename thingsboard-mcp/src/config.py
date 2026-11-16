@@ -22,6 +22,7 @@ class ThingsBoardConfig(BaseModel):
     password: Optional[str] = Field(default=None, description="Tenant password")
     token: Optional[str] = Field(default=None, description="Existing JWT bearer token")
     timeout_seconds: float = Field(default=10.0, description="HTTP request timeout in seconds")
+    profile_id: Optional[str] = Field(default=None, description="Agent profile isolation key")
 
 
 def _extract_tb_section(profile_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -73,12 +74,14 @@ def resolve_thingsboard_config(
     """
     raw_tb: Dict[str, Any] = {}
     source_name = "none"
+    profile_id = None
 
     # 1. Profile Dict
     if profile_dict:
         extracted = _extract_tb_section(profile_dict)
         if extracted:
             raw_tb = extracted
+            profile_id = str(profile_dict.get('id') or '') or None
             source_name = f"profile dict (agent: {profile_dict.get('id', profile_dict.get('name', 'unnamed'))})"
 
     # 2. Profile File (Explicit, Env Var, or Default)
@@ -96,6 +99,7 @@ def resolve_thingsboard_config(
                     extracted = _extract_tb_section(data)
                     if extracted:
                         raw_tb = extracted
+                        profile_id = str(data.get('id') or Path(target_path).resolve())
                         source_name = f"profile file ({target_path})"
                     else:
                         logger.warning("Profile file %s has no 'integrations.thingsboard' section", target_path)
@@ -140,4 +144,5 @@ def resolve_thingsboard_config(
         password=password,
         token=token,
         timeout_seconds=timeout_float,
+        profile_id=profile_id,
     )
