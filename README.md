@@ -68,32 +68,31 @@ Bảng sơ đồ chân I2S cho vi điều khiển YOLO UNO (ESP32-S3), microphon
 ## 📁 Cấu Trúc Thư Mục (Project Structure)
 
 ```
-02_tts_stt_model/
+ESP32-AI-WebServer/
 ├── docker-compose.yml          # Điều phối 5 container cơ bản (Ollama, Whisper, Piper, MCP-Gateway, Gateway)
-├── docker-compose.deploy.yml   # Điều phối các dịch vụ Platform (Platform-Bridge, ThingsBoard-MCP)
-├── verify_e2e_deploy.py        # Kiểm thử E2E tự động toàn bộ Platform (Bridge + MCP SSE + WebSocket Handshake)
-├── start_all.bat               # Script 1-Click khởi chạy, tải model và test toàn trình trên Windows
+├── docker-compose.deploy.yml   # Điều phối các dịch vụ Platform (Platform-Bridge, ThingsBoard-MCP, XiaoZhi)
+├── start_all.bat               # Script 1-Click khởi chạy và tải model trên Windows
 ├── run_mic_test.bat            # Script 1-Click bật trợ lý giọng nói Real-Time rảnh tay trên Laptop
 ├── mic_test.py                 # Trợ lý giọng nói Real-Time (Auto VAD + SSE Streaming + Context Memory)
-├── init_models.bat             # Script tải model tiếng Việt & pull Qwen (Windows)
-├── init_models.sh              # Script tải model tiếng Việt & pull Qwen (Linux)
-├── test_pipeline.py            # Script kiểm thử Round-Trip (LLM -> TTS -> STT -> Gateway)
-├── test_mcp_flow.py            # Script kiểm thử tự động MCP Tool Calling & Direct LLM
-├── HANDOFF.md                  # Tài liệu bàn giao kỹ thuật toàn trình (Full System Handoff)
-├── XIAOZHI_CONFIG.md           # Mẫu cấu hình XiaoZhi Server (YAML & JSON)
+├── agent_profile.json          # Cấu hình hồ sơ Agent chia sẻ cho ThingsBoard MCP
 │
+├── scripts/                    # Scripts tiện ích / khởi tạo
+│   ├── init_models.bat         # Script tải model tiếng Việt & pull Qwen (Windows)
+│   └── init_models.sh          # Script tải model tiếng Việt & pull Qwen (Linux)
+├── docs/                       # Toàn bộ tài liệu hướng dẫn, bàn giao & sơ đồ hệ thống
+│   ├── HANDOFF.md              # Tài liệu bàn giao kỹ thuật toàn trình (Full System Handoff)
+│   ├── TASMOTA_THINGSBOARD_HANDOFF.md # Hướng dẫn kết nối Tasmota ↔ ThingsBoard (2 chiều)
+│   ├── XIAOZHI_CONFIG.md       # Mẫu cấu hình XiaoZhi Server (YAML & JSON)
+│   ├── DEPLOY_MACHINE_B.md     # Hướng dẫn kết nối từ máy Linux khác
+│   ├── DEPLOY_AWS.md           # Hướng dẫn đưa toàn bộ hệ thống lên máy chủ AWS EC2
+│   ├── spec-alpha-0.2.md       # Đặc tả kỹ thuật Provisioning Alpha 0.2
+│   └── images/                 # Ảnh chụp màn hình và sơ đồ hệ thống
+├── data/                       # Dữ liệu cấu hình Agent cục bộ (agents.json)
+├── deploy/                     # Cấu hình runtime mount cho Docker deploy (platform-data, xiaozhi-data)
 ├── xiaozhi-console/            # Frontend Web Console (React + TypeScript + Tailwind + Lucide)
 ├── platform-bridge/            # Platform Bridge FastAPI Server (Port 8005) & Embedded Console Dist
 ├── thingsboard-mcp/            # Dedicated ThingsBoard Model Context Protocol (MCP) Server (Port 8009)
 ├── firmware/                   # Mã nguồn C++ ESP32 firmware với platform provisioning & NVS
-├── docs/                       # Tài liệu chi tiết & Đặc tả kỹ thuật (Spec Alpha 0.2, hình ảnh minh họa)
-│   ├── spec-alpha-0.2.md
-│   └── images/                 # Ảnh chụp màn hình và sơ đồ hệ thống
-├── tests/                      # Bộ kiểm thử tự động (Unit & Integration)
-│   ├── test_alpha02_provisioning.py
-│   ├── test_alpha_console_integration.py
-│   ├── test_phase1b_dual_device.py
-│   └── test_virtual_pc_profile.py
 ├── services/                   # Module MCP Agent Gateway & MCP Server
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -134,11 +133,8 @@ Bảng sơ đồ chân I2S cho vi điều khiển YOLO UNO (ESP32-S3), microphon
 docker compose up -d --build
 
 # 2. Tải model tiếng Việt & LLM
-chmod +x init_models.sh
-./init_models.sh
-
-# 3. Kiểm thử toàn trình
-python3 test_pipeline.py
+chmod +x scripts/init_models.sh
+./scripts/init_models.sh
 ```
 
 ---
@@ -192,19 +188,13 @@ TTS:
 
 ## 📚 Tài Liệu Bổ Sung
 
-- [XIAOZHI_CONFIG.md](XIAOZHI_CONFIG.md): Chi tiết các định dạng cấu hình YAML / JSON.
+- [docs/HANDOFF.md](docs/HANDOFF.md): Tài liệu bàn giao kỹ thuật toàn trình.
+- [docs/TASMOTA_THINGSBOARD_HANDOFF.md](docs/TASMOTA_THINGSBOARD_HANDOFF.md): Hướng dẫn kết nối Tasmota ↔ ThingsBoard (2 chiều).
+- [docs/DEPLOY_MACHINE_B.md](docs/DEPLOY_MACHINE_B.md): Hướng dẫn kết nối từ máy Linux làm XiaoZhi Server qua mạng LAN.
+- [docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md): Hướng dẫn đưa toàn bộ cụm AI lên máy ảo AWS EC2 `g4dn.xlarge` kèm SSL WSS.
+- [docs/XIAOZHI_CONFIG.md](docs/XIAOZHI_CONFIG.md): Chi tiết các định dạng cấu hình YAML / JSON.
 
 ---
 
 ## 📄 License
 Dự án được phân phối dưới giấy phép [MIT](LICENSE).
-
-### Native ThingsBoard dashboards
-
-The ThingsBoard IoT page includes a native device view. Configure a separate console account with `CONSOLE_USERNAME` and a strong `CONSOLE_PASSWORD` in the platform bridge environment, then restart the bridge. The deploy Compose file passes these variables from its environment (or `.env`). Do not commit credentials. Console sessions expire after eight hours and are cleared when the bridge restarts.
-
-The bridge uses the ThingsBoard credentials already configured for `agent_101`. Device telemetry and server attributes refresh every 15 seconds. Thermostat alarm flags and thresholds can be updated from the console and are saved to ThingsBoard. The dashboard list is read from ThingsBoard; the other dashboard-specific widgets are not yet reproduced. Use HTTPS or a trusted local network because the console account password is sent to the bridge at sign-in.
-
-### Multi-user console
-
-Console accounts are created by the server administrator; new accounts start with empty workspaces. See [Multi-user console and device setup](docs/multi-user-auth.md) for account commands, required bridge secrets, TLS and network routing, and device re-enrollment.
