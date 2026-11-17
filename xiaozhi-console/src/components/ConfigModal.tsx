@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Agent, AgentConfig } from '../types';
-import { INITIAL_VOICES, INITIAL_MODELS, MCP_TOOLS } from '../data/mockData';
-import { X, Volume2, Search, RotateCcw, Sparkles, ShieldAlert, Laptop, Check } from 'lucide-react';
+import { INITIAL_VOICES, INITIAL_MODELS } from '../data/mockData';
+import { X, Volume2, Search, RotateCcw, ShieldAlert, Laptop, Check } from 'lucide-react';
 import { useToast } from './Toast';
 import { SupportedLanguage, TRANSLATIONS } from '../i18n';
 import { testThingsBoard } from '../api/client';
@@ -11,7 +11,7 @@ interface ConfigModalProps {
   agent: Agent;
   language: SupportedLanguage;
   onClose: () => void;
-  onSave: (updatedConfig: AgentConfig) => void;
+  onSave: (updatedConfig: AgentConfig) => Promise<boolean>;
 }
 
 export function ConfigModal({ open, agent, language, onClose, onSave }: ConfigModalProps) {
@@ -86,22 +86,8 @@ export function ConfigModal({ open, agent, language, onClose, onSave }: ConfigMo
     }));
   };
 
-  const handleToggleMcp = (toolId: string) => {
-    setConfig(prev => {
-      const exists = prev.mcpEndpoints.includes(toolId);
-      return {
-        ...prev,
-        mcpEndpoints: exists
-          ? prev.mcpEndpoints.filter(id => id !== toolId)
-          : [...prev.mcpEndpoints, toolId]
-      };
-    });
-  };
-
-  const handleSave = () => {
-    onSave(config);
-    success(t.config.savedSuccess);
-    onClose();
+  const handleSave = async () => {
+    if (await onSave(config)) onClose();
   };
 
   const characterTokens = Math.round(config.character.length * 1.5);
@@ -399,7 +385,7 @@ export function ConfigModal({ open, agent, language, onClose, onSave }: ConfigMo
                     <label className="text-xs font-medium text-foreground">ThingsBoard Host URL</label>
                     <input
                       type="text"
-                      value={config.integrations?.thingsboard?.host || 'https://codehelpers.tech'}
+                      value={config.integrations?.thingsboard?.host || ''}
                       onChange={e => {
                         const host = e.target.value;
                         setConfig(prev => ({
@@ -413,7 +399,7 @@ export function ConfigModal({ open, agent, language, onClose, onSave }: ConfigMo
                           }
                         }));
                       }}
-                      placeholder="https://codehelpers.tech"
+                      placeholder="https://thingsboard.example"
                       className="w-full rounded-md border bg-background px-3 py-1.5 text-xs outline-none focus:ring-2 focus:ring-ring"
                     />
                   </div>
@@ -494,8 +480,8 @@ export function ConfigModal({ open, agent, language, onClose, onSave }: ConfigMo
                     <ShieldAlert className="size-3.5 text-amber-500 shrink-0" />
                     <span className="text-[11px]">
                       {language === 'vi'
-                        ? 'Lưu ý Alpha 0.1: MCP chia sẻ tệp cấu hình agent_profile.json. Phân lập đa phiên đồng thời sẽ hoàn thiện ở Phase 2.'
-                        : 'Alpha 0.1 Notice: MCP reads active credentials from shared agent_profile.json. Concurrent session isolation is planned for Phase 2.'}
+                        ? 'Thông tin xác thực thuộc về trợ lý này. Công cụ MCP dùng chung đã được tắt.'
+                        : 'Credentials belong to this agent. Shared MCP tools are disabled.'}
                     </span>
                   </div>
 
@@ -517,53 +503,6 @@ export function ConfigModal({ open, agent, language, onClose, onSave }: ConfigMo
                 )}
               </div>
 
-              {/* Common MCP Tools */}
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h3 className="text-sm font-medium text-foreground">{t.config.mcpTools}</h3>
-                    <p className="text-xs text-muted-foreground">
-                      {t.config.mcpDesc}
-                    </p>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {MCP_TOOLS.map(tool => {
-                    const isEnabled = config.mcpEndpoints.includes(tool.id);
-                    return (
-                      <div
-                        key={tool.id}
-                        className="flex items-start justify-between p-3.5 rounded-lg border bg-card gap-3"
-                      >
-                        <div className="space-y-1">
-                          <div className="flex items-center gap-1.5">
-                            <Sparkles className="size-3.5 text-primary" />
-                            <span className="text-xs font-semibold text-foreground">{tool.title}</span>
-                          </div>
-                          <p className="text-[11px] text-muted-foreground leading-snug">
-                            {tool.description}
-                          </p>
-                        </div>
-
-                        <button
-                          type="button"
-                          onClick={() => handleToggleMcp(tool.id)}
-                          className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none ${
-                            isEnabled ? 'bg-primary' : 'bg-muted'
-                          }`}
-                        >
-                          <span
-                            className={`inline-block size-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out ${
-                              isEnabled ? 'translate-x-4' : 'translate-x-0'
-                            }`}
-                          />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
             </div>
           )}
         </div>

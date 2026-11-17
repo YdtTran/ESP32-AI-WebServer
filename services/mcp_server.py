@@ -21,7 +21,7 @@ COREIOT_PUBLIC_ID = os.getenv("COREIOT_PUBLIC_ID", "ffd43ad0-776f-11f1-9dee-09c3
 COREIOT_DASHBOARD_ID = os.getenv("COREIOT_DASHBOARD_ID", "a14cb550-d8c2-11f1-9298-f795494fee72")
 COREIOT_USERNAME = os.getenv("COREIOT_USERNAME", "").strip()
 COREIOT_PASSWORD = os.getenv("COREIOT_PASSWORD", "").strip()
-COREIOT_DEVICE_TOKEN = os.getenv("COREIOT_DEVICE_TOKEN", "iqYmkU3CuCQoPtxnaxBm").strip()
+COREIOT_DEVICE_TOKEN = os.getenv("COREIOT_DEVICE_TOKEN", "").strip()
 
 # Persistent HTTP client reuses TLS connections to app.coreiot.io
 _http = httpx.Client(

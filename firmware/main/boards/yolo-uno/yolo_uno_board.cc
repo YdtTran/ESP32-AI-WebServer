@@ -2,15 +2,10 @@
 #include "application.h"
 #include "button.h"
 #include "audio_codec.h"
-#include "display/lcd_display.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <driver/i2s_std.h>
-#include <driver/spi_common.h>
-#include <esp_lcd_panel_vendor.h>
-#include <esp_lcd_panel_io.h>
-#include <esp_lcd_panel_ops.h>
 #include <vector>
 #include <cmath>
 #include <algorithm>
@@ -18,30 +13,11 @@
 
 #define TAG "YoloUno"
 
-// Pin Definitions based on verified hardware:
-// Microphone INMP441 (I2S Input)
-#define MIC_I2S_BCLK GPIO_NUM_4
-#define MIC_I2S_WS   GPIO_NUM_5
-#define MIC_I2S_DATA GPIO_NUM_6
-
-// Amplifier MAX98357A (I2S Output, shared clocks)
-#define SPK_I2S_BCLK GPIO_NUM_4
-#define SPK_I2S_WS   GPIO_NUM_5
+// Shared I2S clocks, INMP441 input and MAX98357A output
+#define MIC_I2S_BCLK GPIO_NUM_6
+#define MIC_I2S_WS   GPIO_NUM_10
+#define MIC_I2S_DATA GPIO_NUM_17
 #define SPK_I2S_DATA GPIO_NUM_7
-
-// LCD ST7789 (SPI)
-#define DISPLAY_MOSI_PIN GPIO_NUM_11
-#define DISPLAY_CLK_PIN  GPIO_NUM_12
-#define DISPLAY_RST_PIN  GPIO_NUM_10
-#define DISPLAY_DC_PIN   GPIO_NUM_9
-#define DISPLAY_CS_PIN   GPIO_NUM_8
-#define DISPLAY_BL_PIN   GPIO_NUM_13
-
-#define DISPLAY_WIDTH    240
-#define DISPLAY_HEIGHT   240
-
-LV_FONT_DECLARE(font_puhui_16_4);
-LV_FONT_DECLARE(font_awesome_16_4);
 
 class YoloUnoAudioCodec : public AudioCodec {
 private:
@@ -55,7 +31,6 @@ public:
         output_sample_rate_ = sample_rate;
         input_channels_ = 1;
         output_channels_ = 1;
-        output_volume_ = 90;
 
         i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
         chan_cfg.dma_desc_num = AUDIO_CODEC_DMA_DESC_NUM;
@@ -153,60 +128,9 @@ static YoloUnoAudioCodec g_audio_codec(16000, MIC_I2S_BCLK, MIC_I2S_WS, SPK_I2S_
 class YoloUnoBoard : public WifiBoard {
 private:
     Button boot_button_{GPIO_NUM_0};
-    LcdDisplay* display_ = nullptr;
-
-    void InitializeSpi() {
-        spi_bus_config_t buscfg = {};
-        buscfg.mosi_io_num = DISPLAY_MOSI_PIN;
-        buscfg.miso_io_num = GPIO_NUM_NC;
-        buscfg.sclk_io_num = DISPLAY_CLK_PIN;
-        buscfg.quadwp_io_num = GPIO_NUM_NC;
-        buscfg.quadhd_io_num = GPIO_NUM_NC;
-        buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
-        ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
-    }
-
-    void InitializeLcdDisplay() {
-        esp_lcd_panel_io_handle_t panel_io = nullptr;
-        esp_lcd_panel_handle_t panel = nullptr;
-
-        esp_lcd_panel_io_spi_config_t io_config = {};
-        io_config.cs_gpio_num = DISPLAY_CS_PIN;
-        io_config.dc_gpio_num = DISPLAY_DC_PIN;
-        io_config.spi_mode = 0;
-        io_config.pclk_hz = 40 * 1000 * 1000;
-        io_config.trans_queue_depth = 10;
-        io_config.lcd_cmd_bits = 8;
-        io_config.lcd_param_bits = 8;
-        ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &panel_io));
-
-        esp_lcd_panel_dev_config_t panel_config = {};
-        panel_config.reset_gpio_num = DISPLAY_RST_PIN;
-        panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
-        panel_config.bits_per_pixel = 16;
-        ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
-
-        esp_lcd_panel_reset(panel);
-        esp_lcd_panel_init(panel);
-        esp_lcd_panel_invert_color(panel, true);
-        esp_lcd_panel_swap_xy(panel, false);
-        esp_lcd_panel_mirror(panel, false, false);
-
-        display_ = new SpiLcdDisplay(panel_io, panel,
-                                    DISPLAY_WIDTH, DISPLAY_HEIGHT, 0, 0, false, false, false,
-                                    {
-                                        .text_font = &font_puhui_16_4,
-                                        .icon_font = &font_awesome_16_4,
-                                        .emoji_font = font_emoji_32_init(),
-                                    });
-    }
 
 public:
     YoloUnoBoard() {
-        InitializeSpi();
-        InitializeLcdDisplay();
-        GetBacklight()->RestoreBrightness();
-
         boot_button_.OnClick([]() {
             Application::GetInstance().ToggleChatState();
         });
@@ -216,14 +140,7 @@ public:
         return &g_audio_codec;
     }
 
-    Display* GetDisplay() override {
-        return display_;
-    }
 
-    Backlight* GetBacklight() override {
-        static PwmBacklight backlight(DISPLAY_BL_PIN, false);
-        return &backlight;
-    }
 };
 
 DECLARE_BOARD(YoloUnoBoard);

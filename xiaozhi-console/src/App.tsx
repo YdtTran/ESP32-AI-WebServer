@@ -1,13 +1,11 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { Agent, AgentConfig, Device, ChatSession } from './types';
-import { loadAgentsFromStorage, saveAgentsToStorage } from './data/mockData';
 import {
   fetchAgents,
   createAgent,
   updateAgent,
   deleteAgent,
   fetchDevices,
-  bindDevice,
   unbindDevice,
   testThingsBoard,
   fetchThingsBoardTelemetry,
@@ -32,10 +30,8 @@ import {
   Cpu,
   Laptop,
   Check,
-  ShieldAlert,
   Trash2,
   RefreshCw,
-  ExternalLink,
   Radio,
   SlidersHorizontal,
   ShieldCheck,
@@ -45,7 +41,7 @@ export function App() {
   const { success, error } = useToast();
 
   // State
-  const [agents, setAgents] = useState<Agent[]>(() => loadAgentsFromStorage());
+  const [agents, setAgents] = useState<Agent[]>([]);
   const [allDevices, setAllDevices] = useState<Device[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -79,19 +75,17 @@ export function App() {
   // Split button dropdown
   const [splitDropdownOpen, setSplitDropdownOpen] = useState(false);
   const splitRef = useRef<HTMLDivElement>(null);
+  const chatUpdates = useRef(Promise.resolve());
 
   // Sync with Backend
   const loadData = async () => {
     try {
       const remoteAgents = await fetchAgents();
-      if (remoteAgents && remoteAgents.length > 0) {
-        setAgents(remoteAgents);
-        saveAgentsToStorage(remoteAgents);
-      }
+      setAgents(remoteAgents);
       const remoteDevices = await fetchDevices();
       setAllDevices(remoteDevices);
     } catch (e) {
-      console.warn('Backend sync failed, using cached store', e);
+      console.warn('Backend sync failed', e);
     }
   };
 
@@ -137,7 +131,7 @@ export function App() {
   const refreshTelemetry = async () => {
     setIsLoadingTelemetry(true);
     try {
-      const res = await fetchThingsBoardTelemetry('agent_101');
+      const res = await fetchThingsBoardTelemetry(selectedAgentId || agents[0]?.id || '');
       if (res.status === 'success') {
         setTbDevices(res.devices || []);
       }
@@ -204,7 +198,7 @@ export function App() {
   };
 
   const handleUpdateConfig = async (updatedConfig: AgentConfig) => {
-    if (!activeAgent) return;
+    if (!activeAgent) return false;
     try {
       await updateAgent(activeAgent.id, {
         config: updatedConfig,
@@ -213,8 +207,10 @@ export function App() {
       });
       await loadData();
       success(t.config.savedSuccess);
+      return true;
     } catch (e: any) {
       error(e.message || 'Update config failed');
+      return false;
     }
   };
 
@@ -225,24 +221,18 @@ export function App() {
 
   const handleUpdateChats = (updatedChats: ChatSession[]) => {
     if (!activeAgent) return;
+    const agentId = activeAgent.id;
+    chatUpdates.current = chatUpdates.current.then(() => updateAgent(agentId, { chats: updatedChats })).then(() => {}, e => {
+      error(e.message || 'Failed to save chat');
+    });
     setAgents(prev => prev.map(a => {
-      if (a.id !== activeAgent.id) return a;
+      if (a.id !== agentId) return a;
       return {
         ...a,
         chats: updatedChats,
         lastSeen: 'Just now',
       };
     }));
-  };
-
-  const handleManualAddDeviceGlobal = async (mac: string, agentId: string, customAgentName?: string) => {
-    try {
-      await bindDevice(mac, agentId, customAgentName || `ESP32 (${mac.slice(-5)})`);
-      await loadData();
-      success(language === 'vi' ? 'Gán thiết bị thành công!' : 'Device bound successfully!');
-    } catch (e: any) {
-      error(e.message || 'Bind device failed');
-    }
   };
 
   const handleUnbindDeviceGlobal = async (mac: string) => {
@@ -259,7 +249,7 @@ export function App() {
     setTbTesting(true);
     setTbTestResult(null);
     try {
-      const res = await testThingsBoard('agent_101');
+      const res = await testThingsBoard(selectedAgentId || agents[0]?.id || '');
       if (res.status === 'success') {
         setTbTestResult(`✓ ${res.message}`);
         success(language === 'vi' ? 'Kết nối thành công!' : 'Connected successfully!');
@@ -295,8 +285,10 @@ export function App() {
         {currentNavTab === 'agents' && (
           <div className="space-y-6 animate-in fade-in duration-200">
             {/* Header Card with Gradient Aura */}
-            <div className="relative overflow-hidden rounded-xl border bg-card px-4 py-4 shadow-xs sm:px-5">
-              <div className="pointer-events-none absolute -right-16 -top-20 size-48 rounded-full bg-primary/10 blur-3xl" />
+            <div className="relative rounded-xl border bg-card px-4 py-4 shadow-xs sm:px-5">
+              <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-xl">
+                <div className="absolute -right-16 -top-20 size-48 rounded-full bg-primary/10 blur-3xl" />
+              </div>
 
               <div className="relative flex flex-wrap items-center justify-between gap-4">
                 {/* Left: Icon & Title */}
@@ -610,54 +602,17 @@ export function App() {
                 </div>
               </div>
 
-              {/* Status Pills Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t">
-                <div className="p-3 rounded-lg border bg-muted/20 space-y-1">
-                  <div className="text-[11px] font-medium text-muted-foreground">Instance Host URL</div>
-                  <div className="text-xs font-semibold text-foreground flex items-center gap-1">
-                    <span>https://codehelpers.tech</span>
-                    <a href="https://codehelpers.tech" target="_blank" rel="noreferrer" className="text-primary hover:underline">
-                      <ExternalLink className="size-3 inline" />
-                    </a>
-                  </div>
-                </div>
-
-                <div className="p-3 rounded-lg border bg-muted/20 space-y-1">
-                  <div className="text-[11px] font-medium text-muted-foreground">API Credential Security</div>
-                  <div className="text-xs font-mono font-semibold text-emerald-600 dark:text-emerald-400">
-                    tb_G5TS...PluA (Masked · Backend Stored)
-                  </div>
-                </div>
-
-                <div className="p-3 rounded-lg border bg-muted/20 space-y-1">
-                  <div className="text-[11px] font-medium text-muted-foreground">MCP Service Status (Port 8009)</div>
-                  <div className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
-                    <span className="size-2 rounded-full bg-emerald-500 animate-pulse" />
-                    <span>SSE Server Active (3 Tools Registered)</span>
-                  </div>
-                </div>
-              </div>
+              <p className="border-t pt-3 text-xs text-muted-foreground">
+                {language === 'vi'
+                  ? 'Thông tin ThingsBoard thuộc về hồ sơ trợ lý đang chọn. Các công cụ MCP dùng chung đã được tắt.'
+                  : 'ThingsBoard settings belong to the selected agent. Shared MCP tools are disabled.'}
+              </p>
 
               {tbTestResult && (
                 <div className="p-3 rounded-lg bg-muted/30 border text-xs font-mono">
                   {tbTestResult}
                 </div>
               )}
-            </div>
-
-            {/* Architecture Limitation Notice */}
-            <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 flex items-start gap-3 text-xs">
-              <ShieldAlert className="size-4 text-amber-500 shrink-0 mt-0.5" />
-              <div className="space-y-1 text-muted-foreground">
-                <div className="font-semibold text-foreground">
-                  {language === 'vi' ? 'Giới hạn kiến trúc Alpha 0.1' : 'Important Alpha 0.1 Architectural Boundary'}
-                </div>
-                <p>
-                  {language === 'vi'
-                    ? 'ThingsBoard là nguồn dữ liệu IoT bên ngoài. Nền tảng quản lý thông tin xác thực và truy xuất qua MCP tools an toàn. Trong bản Alpha 0.1, ThingsBoard MCP Server đọc thông tin xác thực từ tệp agent_profile.json dùng chung. Cơ chế phân lập định tuyến đa phiên đồng thời sẽ được cung cấp ở Phase 2.'
-                    : 'ThingsBoard is an external IoT telemetry source. This console manages credentials and authorized MCP data retrieval. In Alpha 0.1, ThingsBoard MCP reads from the active shared agent_profile.json file. Simultaneous multi-tenant session isolation is planned for Phase 2.'}
-                </p>
-              </div>
             </div>
 
             {/* Telemetry Preview Table */}
@@ -800,7 +755,6 @@ export function App() {
         activeAgentId={activeAgent?.id}
         onClose={() => setOpenAddDeviceModal(false)}
         onDeviceRegistered={loadData}
-        onManualAddDevice={handleManualAddDeviceGlobal}
       />
 
       <CreateAgentModal

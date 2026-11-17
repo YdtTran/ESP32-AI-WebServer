@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { Agent, ChatSession, ChatMessage } from '../types';
-import { sendAgentChat } from '../api/client';
+import { fetchAgents, sendAgentChat } from '../api/client';
 import { X, MessageSquare, Trash2, Plus, Volume2, VolumeX, Send, ArrowLeft, Wrench, Sparkles, Check, Copy } from 'lucide-react';
 import { useToast } from './Toast';
 import { SupportedLanguage, TRANSLATIONS } from '../i18n';
@@ -13,12 +13,16 @@ interface ChatModalProps {
   onUpdateChats: (chats: ChatSession[]) => void;
 }
 
+function validSessions(chats: ChatSession[] = []): ChatSession[] {
+  return chats.filter((chat, index) => typeof chat?.id === 'string' && Array.isArray(chat.messages) && chats.findIndex(item => item?.id === chat.id) === index);
+}
+
 export function ChatModal({ open, agent, language, onClose, onUpdateChats }: ChatModalProps) {
   const { success } = useToast();
   const t = TRANSLATIONS[language];
-  const [sessions, setSessions] = useState<ChatSession[]>(() => agent.chats || []);
+  const [sessions, setSessions] = useState<ChatSession[]>(() => validSessions(agent.chats));
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(
-    agent.chats && agent.chats.length > 0 ? agent.chats[0].id : null
+    validSessions(agent.chats)[0]?.id || null
   );
   const [mobileView, setMobileView] = useState<'sessions' | 'messages'>('messages');
   const [inputText, setInputText] = useState('');
@@ -28,6 +32,36 @@ export function ChatModal({ open, agent, language, onClose, onUpdateChats }: Cha
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const activeSession = sessions.find(s => s.id === selectedSessionId) || sessions[0];
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    const cachedChats = validSessions(agent.chats);
+    const localChats = cachedChats.filter(chat => !chat.id.startsWith('device:'));
+    setSessions(cachedChats);
+    setSelectedSessionId(cachedChats[0]?.id || null);
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const agents = await fetchAgents();
+        if (cancelled) return;
+        const chats = validSessions(agents.find(item => item.id === agent.id)?.chats);
+        setSessions(current => {
+          const updated = [...chats.map(chat => {
+            const existing = current.find(session => session.id === chat.id);
+            return existing && JSON.stringify(existing) === JSON.stringify(chat) ? existing : chat;
+          }), ...current.filter(chat => !chat.id.startsWith('device:') && !chats.some(saved => saved.id === chat.id))];
+          return JSON.stringify(current) === JSON.stringify(updated) ? current : updated;
+        });
+        setSelectedSessionId(current => current || chats[0]?.id || localChats[0]?.id || null);
+      } catch {
+        // Retry on the next refresh if the bridge is temporarily unavailable.
+      }
+      if (!cancelled) timer = setTimeout(refresh, 3000);
+    };
+    refresh();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [open, agent.id]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -141,7 +175,7 @@ export function ChatModal({ open, agent, language, onClose, onUpdateChats }: Cha
       };
 
       const finalSessions = updatedSessions.map(s => s.id === finalizedSession.id ? finalizedSession : s);
-      setSessions(finalSessions);
+      setSessions(current => current.map(s => s.id === finalizedSession.id ? finalizedSession : s));
       onUpdateChats(finalSessions);
     } catch (err: any) {
       const errMsg: ChatMessage = {
@@ -157,7 +191,7 @@ export function ChatModal({ open, agent, language, onClose, onUpdateChats }: Cha
         messages: finalMessages
       };
       const finalSessions = updatedSessions.map(s => s.id === finalizedSession.id ? finalizedSession : s);
-      setSessions(finalSessions);
+      setSessions(current => current.map(s => s.id === finalizedSession.id ? finalizedSession : s));
       onUpdateChats(finalSessions);
     } finally {
       setIsTyping(false);
@@ -268,13 +302,13 @@ export function ChatModal({ open, agent, language, onClose, onUpdateChats }: Cha
                         </div>
                       </div>
 
-                      <button
+                      {!s.id.startsWith('device:') && <button
                         onClick={e => handleDeleteSession(s.id, e)}
                         className="opacity-0 group-hover:opacity-100 p-1 text-muted-foreground hover:text-destructive rounded transition-opacity"
                         title="Delete chat"
                       >
                         <Trash2 className="size-3.5" />
-                      </button>
+                      </button>}
                     </div>
                   );
                 })
@@ -394,7 +428,11 @@ export function ChatModal({ open, agent, language, onClose, onUpdateChats }: Cha
               {t.chat.disclaimer}
             </div>
 
-            <div className="p-3 border-t bg-card">
+            {activeSession?.id.startsWith('device:') ? (
+              <div className="p-3 border-t text-center text-xs text-muted-foreground">
+                {language === 'vi' ? 'Lịch sử từ thiết bị chỉ có thể xem.' : 'Device history is read-only.'}
+              </div>
+            ) : <div className="p-3 border-t bg-card">
               <div className="flex items-center gap-2">
                 <input
                   type="text"
@@ -413,7 +451,7 @@ export function ChatModal({ open, agent, language, onClose, onUpdateChats }: Cha
                   <span>{t.chat.send}</span>
                 </button>
               </div>
-            </div>
+            </div>}
           </div>
         </div>
       </div>

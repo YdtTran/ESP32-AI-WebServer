@@ -104,14 +104,17 @@ std::string PlatformProvisioning::GetPlatformUrl() {
         return url;
     }
 
-    // Fallback: derive from ota_url by swapping port 8003 with 8005
+    // Derive the bridge origin from the configured OTA URL.
     std::string ota_url = wifi_settings.GetString("ota_url");
-    if (!ota_url.empty()) {
-        size_t port_pos = ota_url.find(":8003");
-        if (port_pos != std::string::npos) {
-            std::string base = ota_url.substr(0, port_pos);
-            return base + ":8005";
+    auto scheme = ota_url.find("://");
+    if (scheme != std::string::npos) {
+        auto path = ota_url.find('/', scheme + 3);
+        std::string origin = ota_url.substr(0, path);
+        auto port = origin.rfind(":8003");
+        if (port != std::string::npos && port + 5 == origin.size()) {
+            origin.replace(port, 5, ":8005");
         }
+        return origin;
     }
 
     return "http://192.168.1.7:8005";

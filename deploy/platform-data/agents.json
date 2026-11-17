@@ -17,7 +17,7 @@
     "integrations": {
       "thingsboard": {
         "host": "https://codehelpers.tech",
-        "api_key": "tb_G5TSH2WJsF3g25Q_7jImZwyUpdAYqGtI6cT86c-dMCKy_d8WZ3M3rNjn9zhzOT5Y9AnvV-KKQPpIQChD7qPluA",
+        "api_key": "",
         "display_name": "CodeHelpers Production IoT",
         "timeout_seconds": 10.0
       }
@@ -281,7 +281,7 @@
     "integrations": {
       "thingsboard": {
         "host": "https://codehelpers.tech",
-        "api_key": "tb_G5TSH2WJsF3g25Q_7jImZwyUpdAYqGtI6cT86c-dMCKy_d8WZ3M3rNjn9zhzOT5Y9AnvV-KKQPpIQChD7qPluA",
+        "api_key": "",
         "display_name": "CodeHelpers Production IoT",
         "timeout_seconds": 10.0
       }
@@ -307,7 +307,7 @@
     "integrations": {
       "thingsboard": {
         "host": "https://codehelpers.tech",
-        "api_key": "tb_G5TSH2WJsF3g25Q_7jImZwyUpdAYqGtI6cT86c-dMCKy_d8WZ3M3rNjn9zhzOT5Y9AnvV-KKQPpIQChD7qPluA",
+        "api_key": "",
         "display_name": "CodeHelpers Production IoT",
         "timeout_seconds": 10.0
       }

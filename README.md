@@ -81,8 +81,6 @@ Bảng sơ đồ chân I2S cho vi điều khiển YOLO UNO (ESP32-S3), microphon
 ├── test_mcp_flow.py            # Script kiểm thử tự động MCP Tool Calling & Direct LLM
 ├── HANDOFF.md                  # Tài liệu bàn giao kỹ thuật toàn trình (Full System Handoff)
 ├── XIAOZHI_CONFIG.md           # Mẫu cấu hình XiaoZhi Server (YAML & JSON)
-├── DEPLOY_MACHINE_B.md         # Hướng dẫn kết nối từ máy Linux khác
-├── DEPLOY_AWS.md               # Hướng dẫn đưa toàn bộ hệ thống lên máy chủ AWS EC2
 │
 ├── xiaozhi-console/            # Frontend Web Console (React + TypeScript + Tailwind + Lucide)
 ├── platform-bridge/            # Platform Bridge FastAPI Server (Port 8005) & Embedded Console Dist
@@ -194,11 +192,19 @@ TTS:
 
 ## 📚 Tài Liệu Bổ Sung
 
-- [DEPLOY_MACHINE_B.md](DEPLOY_MACHINE_B.md): Hướng dẫn kết nối từ máy Linux làm XiaoZhi Server qua mạng LAN.
-- [DEPLOY_AWS.md](DEPLOY_AWS.md): Hướng dẫn đưa toàn bộ cụm AI lên máy ảo AWS EC2 `g4dn.xlarge` kèm SSL WSS.
 - [XIAOZHI_CONFIG.md](XIAOZHI_CONFIG.md): Chi tiết các định dạng cấu hình YAML / JSON.
 
 ---
 
 ## 📄 License
 Dự án được phân phối dưới giấy phép [MIT](LICENSE).
+
+### Native ThingsBoard dashboards
+
+The ThingsBoard IoT page includes a native device view. Configure a separate console account with `CONSOLE_USERNAME` and a strong `CONSOLE_PASSWORD` in the platform bridge environment, then restart the bridge. The deploy Compose file passes these variables from its environment (or `.env`). Do not commit credentials. Console sessions expire after eight hours and are cleared when the bridge restarts.
+
+The bridge uses the ThingsBoard credentials already configured for `agent_101`. Device telemetry and server attributes refresh every 15 seconds. Thermostat alarm flags and thresholds can be updated from the console and are saved to ThingsBoard. The dashboard list is read from ThingsBoard; the other dashboard-specific widgets are not yet reproduced. Use HTTPS or a trusted local network because the console account password is sent to the bridge at sign-in.
+
+### Multi-user console
+
+Console accounts are created by the server administrator; new accounts start with empty workspaces. See [Multi-user console and device setup](docs/multi-user-auth.md) for account commands, required bridge secrets, TLS and network routing, and device re-enrollment.

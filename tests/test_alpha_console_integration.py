@@ -102,7 +102,6 @@ def test_agent_profiles_and_credential_masking():
         api_key = tb.get("api_key", "")
         if api_key:
             assert "..." in api_key or api_key == "***", f"API key was not masked: {api_key}"
-            assert not api_key.startswith("tb_G5TSH2WJsF3g25Q_"), "Plaintext secret leaked in frontend response!"
             logger.info("  ✓ Agent %s (%s) ThingsBoard API key securely masked: %s", a["id"], a["role"], api_key)
 
     # Test Agent Update (editing name & prompt)
