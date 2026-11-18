@@ -115,6 +115,8 @@ Bảng sơ đồ chân I2S cho vi điều khiển YOLO UNO (ESP32-S3), microphon
 
 ---
 
+For a fresh platform deployment on another machine, see [Reproduce the local deployment](docs/reproduce-deployment.md).
+
 ## 🚀 Khởi Chạy Nhanh (Quick Start)
 
 ### Trên Windows:

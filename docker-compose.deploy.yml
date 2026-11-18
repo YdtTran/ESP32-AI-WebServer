@@ -23,10 +23,10 @@ services:
       - LLM_GATEWAY_URL=http://mcp-gateway:8008/v1
       - BRIDGE_SECRET=${BRIDGE_SECRET:?Set BRIDGE_SECRET}
       - WS_PUBLIC_PORT=8005
-      - PUBLIC_WS_URL=${PUBLIC_WS_URL:-ws://192.168.1.7:8005/xiaozhi/v1/}
-      - PUBLIC_OTA_URL=${PUBLIC_OTA_URL:-http://192.168.1.7:8005/xiaozhi/ota/}
-      - HOST_IP=192.168.1.7
-      - THINGSBOARD_HOST=http://172.18.0.1:8080
+      - PUBLIC_WS_URL=${PUBLIC_WS_URL:-ws://${HOST_IP:-192.168.1.7}:8005/xiaozhi/v1/}
+      - PUBLIC_OTA_URL=${PUBLIC_OTA_URL:-http://${HOST_IP:-192.168.1.7}:8005/xiaozhi/ota/}
+      - HOST_IP=${HOST_IP:-192.168.1.7}
+      - THINGSBOARD_HOST=${THINGSBOARD_HOST:-http://172.18.0.1:8080}
       - THINGSBOARD_ALLOWED_ORIGINS=${THINGSBOARD_ALLOWED_ORIGINS:-http://172.18.0.1:8080}
       - THINGSBOARD_API_KEY=${THINGSBOARD_API_KEY:-}
     networks:
@@ -34,6 +34,8 @@ services:
 
   xiaozhi-server:
     image: iot-xiaozhi-baseline:local
+    build:
+      context: ./deploy/xiaozhi-runtime
     container_name: xiaozhi-server
     restart: unless-stopped
     command: ["python", "app.py"]
@@ -46,8 +48,9 @@ services:
       - WHISPER_URL=http://faster-whisper:8000/v1/audio/transcriptions
       - PIPER_URL=http://piper-tts:10200/v1/audio/speech
       - LLM_URL=http://mcp-gateway:8008/v1
-      - HOST_LAN_IP=192.168.1.7
-      - THINGSBOARD_URL=http://172.18.0.1:8080
+      - BRIDGE_SECRET=${BRIDGE_SECRET:?Set BRIDGE_SECRET}
+      - HOST_LAN_IP=${HOST_IP:-192.168.1.7}
+      - THINGSBOARD_URL=${THINGSBOARD_HOST:-http://172.18.0.1:8080}
     depends_on:
       - platform-bridge
     networks:
