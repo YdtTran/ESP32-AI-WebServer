@@ -9,6 +9,7 @@ tmp/
 # Virtual environments & secrets
 .env
 .env*
+!.env.example
 .venv/
 venv/
 ENV/

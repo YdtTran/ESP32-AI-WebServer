@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI(title="XiaoZhi Unified AI Gateway")
 
-API_KEY = os.getenv("API_KEY", "sk-xiaozhi-local-secret").strip()
+API_KEY = os.getenv("API_KEY", "").strip()
 WHISPER_URL = os.getenv("WHISPER_URL", "http://faster-whisper:8000").rstrip("/")
 PIPER_URL = os.getenv("PIPER_URL", "http://piper-tts:10200").rstrip("/")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
@@ -49,7 +49,9 @@ async def proxy_all(request: Request, path: str):
     is_console_page = norm_path in ("/", "/console") and request.method == "GET"
 
     # 1. Check API Key (exempt browser load of /console UI)
-    if API_KEY and not is_console_page:
+    if not is_console_page:
+        if not API_KEY:
+            return JSONResponse(status_code=503, content={"error": "API_KEY is not configured"})
         auth_header = request.headers.get("authorization", "").strip()
         provided_key = ""
         if auth_header.startswith("Bearer "):

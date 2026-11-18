@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.request
 
-GATEWAY_KEY = os.getenv("API_KEY", "sk-xiaozhi-local-secret")
+GATEWAY_KEY = os.getenv("API_KEY", "")
 DEFAULT_URL = os.getenv("GATEWAY_URL", "http://localhost:8080/v1/chat/completions")
 FALLBACK_URL = "http://localhost:8008/v1/chat/completions"
 

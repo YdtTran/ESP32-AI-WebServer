@@ -22,12 +22,13 @@ services:
       - PIPER_URL=http://piper-tts:10200/v1/audio/speech
       - LLM_GATEWAY_URL=http://mcp-gateway:8008/v1
       - BRIDGE_SECRET=${BRIDGE_SECRET:?Set BRIDGE_SECRET}
+      - API_KEY=${API_KEY:?Set API_KEY in .env}
       - WS_PUBLIC_PORT=8005
-      - PUBLIC_WS_URL=${PUBLIC_WS_URL:-ws://${HOST_IP:-192.168.1.7}:8005/xiaozhi/v1/}
-      - PUBLIC_OTA_URL=${PUBLIC_OTA_URL:-http://${HOST_IP:-192.168.1.7}:8005/xiaozhi/ota/}
-      - HOST_IP=${HOST_IP:-192.168.1.7}
-      - THINGSBOARD_HOST=${THINGSBOARD_HOST:-http://172.18.0.1:8080}
-      - THINGSBOARD_ALLOWED_ORIGINS=${THINGSBOARD_ALLOWED_ORIGINS:-http://172.18.0.1:8080}
+      - PUBLIC_WS_URL=${PUBLIC_WS_URL:-ws://${HOST_IP:?Set HOST_IP in .env}:8005/xiaozhi/v1/}
+      - PUBLIC_OTA_URL=${PUBLIC_OTA_URL:-http://${HOST_IP:?Set HOST_IP in .env}:8005/xiaozhi/ota/}
+      - HOST_IP=${HOST_IP:?Set HOST_IP in .env}
+      - THINGSBOARD_HOST=${THINGSBOARD_HOST:-}
+      - THINGSBOARD_ALLOWED_ORIGINS=${THINGSBOARD_ALLOWED_ORIGINS:-}
       - THINGSBOARD_API_KEY=${THINGSBOARD_API_KEY:-}
     networks:
       - default
@@ -49,8 +50,8 @@ services:
       - PIPER_URL=http://piper-tts:10200/v1/audio/speech
       - LLM_URL=http://mcp-gateway:8008/v1
       - BRIDGE_SECRET=${BRIDGE_SECRET:?Set BRIDGE_SECRET}
-      - HOST_LAN_IP=${HOST_IP:-192.168.1.7}
-      - THINGSBOARD_URL=${THINGSBOARD_HOST:-http://172.18.0.1:8080}
+      - HOST_LAN_IP=${HOST_IP:?Set HOST_IP in .env}
+      - THINGSBOARD_URL=${THINGSBOARD_HOST:-}
     depends_on:
       - platform-bridge
     networks:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Integration test for the Full-Local XiaoZhi AI Backend (Ollama + Piper TTS + Faster-Whisper STT)."""
 import json
+import os
 import socket
 import sys
 import time
@@ -16,7 +17,7 @@ PIPER_URL = "http://localhost:10200/v1/audio/speech"
 PIPER_VOICE = "vi_VN-vais1000-medium"
 WHISPER_URL = "http://localhost:8000/v1/audio/transcriptions"
 GATEWAY_URL = "http://localhost:8080/v1/models"
-GATEWAY_KEY = "sk-xiaozhi-local-secret"
+GATEWAY_KEY = os.environ.get("API_KEY", "")
 OUTPUT_WAV = Path("output_test.wav")
 
 TEST_PROMPT = "Trả lời ngắn gọn trong 1 câu bằng tiếng Việt: Thủ đô của Việt Nam là gì?"

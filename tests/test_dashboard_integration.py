@@ -5,6 +5,18 @@ integration = importlib.import_module('platform-bridge.dashboard_integration')
 
 
 class DashboardIntegrationTests(unittest.TestCase):
+    def test_configured_host_does_not_receive_another_hosts_saved_key(self):
+        from unittest.mock import patch
+        from fastapi import HTTPException
+        saved = {'integrations': {'thingsboard': {'host': 'https://old.example', 'api_key': 'old-key'}}}
+        with patch.object(integration.platform_store, 'get_agent', return_value=saved), \
+             patch.dict('os.environ', {'THINGSBOARD_HOST': 'https://new.example', 'THINGSBOARD_API_KEY': ''}):
+            with self.assertRaises(HTTPException):
+                integration.connection()
+        with patch.object(integration.platform_store, 'get_agent', return_value=saved), \
+             patch.dict('os.environ', {'THINGSBOARD_HOST': 'https://new.example', 'THINGSBOARD_API_KEY': 'new-key'}):
+            self.assertEqual(integration.connection(), ('https://new.example', {'X-Authorization': 'ApiKey new-key'}))
+
     def test_credentials_require_configured_account(self):
         self.assertFalse(integration.valid_credentials('admin', 'password', '', ''))
         self.assertTrue(integration.valid_credentials('operator', 'secret', 'operator', 'secret'))

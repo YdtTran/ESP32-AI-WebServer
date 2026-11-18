@@ -40,7 +40,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mcp_gateway")
 
-API_KEY = os.getenv("API_KEY", "sk-xiaozhi-local-secret").strip()
+API_KEY = os.getenv("API_KEY", "").strip()
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct").strip()
 PORT = int(os.getenv("PORT", "8008"))
@@ -266,7 +266,7 @@ app = FastAPI(
 
 def verify_api_key(authorization: Optional[str] = Header(None)) -> None:
     if not API_KEY:
-        return
+        raise HTTPException(status_code=503, detail="API_KEY is not configured")
     token = ""
     if authorization and authorization.startswith("Bearer "):
         token = authorization[7:].strip()

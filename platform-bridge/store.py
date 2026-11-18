@@ -66,7 +66,7 @@ DEFAULT_AGENTS = [
         },
         "integrations": {
             "thingsboard": {
-                "host": os.getenv("THINGSBOARD_HOST", "https://codehelpers.tech"),
+                "host": os.getenv("THINGSBOARD_HOST", ""),
                 "api_key": os.getenv(
                     "THINGSBOARD_API_KEY",
                     ""
@@ -112,7 +112,7 @@ DEFAULT_AGENTS = [
         },
         "integrations": {
             "thingsboard": {
-                "host": os.getenv("THINGSBOARD_HOST", "https://codehelpers.tech"),
+                "host": os.getenv("THINGSBOARD_HOST", ""),
                 "api_key": os.getenv(
                     "THINGSBOARD_API_KEY",
                     ""
@@ -152,7 +152,7 @@ DEFAULT_AGENTS = [
         },
         "integrations": {
             "thingsboard": {
-                "host": os.getenv("THINGSBOARD_HOST", "https://codehelpers.tech"),
+                "host": os.getenv("THINGSBOARD_HOST", ""),
                 "api_key": os.getenv(
                     "THINGSBOARD_API_KEY",
                     ""

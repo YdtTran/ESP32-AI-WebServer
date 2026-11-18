@@ -97,8 +97,9 @@ async def logout(token: str = Depends(require_session)):
 def connection():
     agent = platform_store.get_agent('agent_101') or {}
     tb = agent.get('integrations', {}).get('thingsboard', {})
-    host = (tb.get('host') or os.getenv('THINGSBOARD_HOST', '')).rstrip('/')
-    key = tb.get('api_key') or os.getenv('THINGSBOARD_API_KEY', '')
+    saved_host = (tb.get('host') or '').rstrip('/')
+    host = (os.getenv('THINGSBOARD_HOST') or saved_host).rstrip('/')
+    key = os.getenv('THINGSBOARD_API_KEY', '') or (tb.get('api_key') if host == saved_host else '')
     if not host or not key:
         raise HTTPException(503, 'ThingsBoard is not configured')
     return host, {'X-Authorization': f'ApiKey {key}'}

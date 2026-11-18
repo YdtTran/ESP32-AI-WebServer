@@ -49,9 +49,7 @@ WHISPER_URL = os.getenv("WHISPER_URL", "http://faster-whisper:8000/v1/audio/tran
 PIPER_URL = os.getenv("PIPER_URL", "http://piper-tts:10200/v1/audio/speech")
 LLM_GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "http://mcp-gateway:8008/v1")
 WS_PUBLIC_PORT = int(os.getenv("WS_PUBLIC_PORT", "8005"))
-HOST_IP = os.getenv("HOST_IP", "192.168.1.7")
-if HOST_IP in ("127.0.0.1", "localhost", "0.0.0.0"):
-    HOST_IP = "192.168.1.7"
+HOST_IP = os.getenv("HOST_IP", "localhost")
 PUBLIC_WS_URL = os.getenv('PUBLIC_WS_URL', f'ws://{HOST_IP}:{WS_PUBLIC_PORT}/xiaozhi/v1/')
 PUBLIC_OTA_URL = os.getenv('PUBLIC_OTA_URL', f'http://{HOST_IP}:8005/xiaozhi/ota/')
 
@@ -219,7 +217,7 @@ async def get_server_base_config():
                 "OpenAILLM": {
                     "type": "openai",
                     "base_url": LLM_GATEWAY_URL,
-                    "api_key": SECRET_KEY,
+                    "api_key": os.getenv("API_KEY", ""),
                     "model_name": "qwen2.5:3b-instruct"
                 }
             },
