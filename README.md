@@ -114,6 +114,8 @@ ESP32-AI-WebServer/
 
 ---
 
+For a fresh platform deployment on another machine, see [Reproduce the local deployment](docs/reproduce-deployment.md).
+
 ## 🚀 Khởi Chạy Nhanh (Quick Start)
 
 ### Trên Windows:
