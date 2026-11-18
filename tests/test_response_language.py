@@ -6,6 +6,12 @@ bridge = importlib.import_module('platform-bridge.app')
 
 
 class ResponseLanguageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_server_model_uses_gateway_key_not_bridge_secret(self):
+        with patch.dict('os.environ', {'API_KEY': 'gateway-secret'}), \
+             patch.object(bridge, 'SECRET_KEY', 'bridge-secret'):
+            config = await bridge.get_server_base_config()
+        self.assertEqual(config['data']['LLM']['OpenAILLM']['api_key'], 'gateway-secret')
+
     async def test_device_prompt_uses_selected_language(self):
         agent = {'id': 'test', 'name': 'Test', 'language': 'en', 'prompt': 'Reply in Vietnamese.'}
         with patch.object(bridge.device_db, 'get_device_by_mac', return_value={'agent_id': 'test'}), patch.object(bridge.accounts, 'get_agent_by_id', return_value=agent):

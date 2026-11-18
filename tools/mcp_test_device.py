@@ -39,7 +39,9 @@ def reply(method, params, state):
 
 
 def main():
-    host = os.environ.get('TB_HOST', 'https://codehelpers.tech').rstrip('/')
+    host = (os.environ.get('TB_HOST') or os.environ.get('THINGSBOARD_HOST') or '').rstrip('/')
+    if not host:
+        raise SystemExit('Set TB_HOST or THINGSBOARD_HOST')
     with open(os.environ['TB_DEVICE_TOKEN_FILE'], encoding='utf-8') as token_file:
         base = f"{host}/api/v1/{token_file.read().strip()}"
     state = {'power': False}

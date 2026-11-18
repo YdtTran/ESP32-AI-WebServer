@@ -20,31 +20,36 @@ Building requires internet access to Docker Hub, PyPI and the PyTorch CPU index.
 
 ## First start
 
-1. Clone this repository and enter its directory. Make a private `.env.deploy`
-   file (it is ignored by Git), with values appropriate to the new host:
+1. Clone this repository and enter its directory. Copy `.env.example` to `.env`,
+   then edit `.env` for this machine. Set `HOST_IP` to the LAN address reachable
+   by the ESP32, and set independent random values for `BRIDGE_SECRET` and
+   `API_KEY` (generate each with `openssl rand -hex 32`). Set the ThingsBoard
+   address, allowed origin and database password if using that integration.
+   Configure a ThingsBoard API key in the console if needed; set
+   `THINGSBOARD_API_KEY` in `.env` for the separate native dashboard.
 
-   ```dotenv
-   HOST_IP=192.168.1.10
-   BRIDGE_SECRET=replace-with-a-long-random-secret
-   CONSOLE_USERNAME=admin
-   CONSOLE_PASSWORD=replace-with-a-strong-password
-   THINGSBOARD_DB_PASSWORD=replace-with-a-different-strong-password
-   THINGSBOARD_HOST=http://192.168.1.10:8080
-   THINGSBOARD_ALLOWED_ORIGINS=http://192.168.1.10:8080
+   ```sh
+   test -e .env || cp .env.example .env
+   chmod 600 .env
    ```
 
-   Use `openssl rand -hex 32` to generate `BRIDGE_SECRET`. Restrict the file's
-   permissions with `chmod 600 .env.deploy`. Both bridge and XiaoZhi receive the
-   same secret; there is no need to place it in `deploy/xiaozhi-data/.config.yaml`.
-   Configure a ThingsBoard API key in the console if using that integration.
+   On an existing installation, retain its current `BRIDGE_SECRET` when moving
+   settings into `.env`; do not generate a replacement unnecessarily.
+   Docker Compose reads `.env` automatically. Keep it private and never commit it;
+   the same bridge secret is passed to the XiaoZhi server automatically.
+   To run Python scripts directly, export their settings first with
+   `set -a; . ./.env; set +a`. Existing agent profiles retain their saved
+   ThingsBoard addresses; update those profiles when moving data to a new host.
+   For the standalone Tasmota simulator, also set `TB_HOST`, `TB_API_KEY`,
+   `MQTT_HOST` and `TB_DOWNLINK_CONVERTER_ID` before running it.
 
 2. If you need a new local ThingsBoard instance, initialize its database **once**
    and then start it. Skip this step when using an existing instance; never run
    initialization against an existing database:
 
    ```sh
-   docker compose --env-file .env.deploy -f docker-compose.thingsboard.yml run --rm -e INSTALL_TB=true thingsboard
-   docker compose --env-file .env.deploy -f docker-compose.thingsboard.yml up -d
+   docker compose -f docker-compose.thingsboard.yml run --rm -e INSTALL_TB=true thingsboard
+   docker compose -f docker-compose.thingsboard.yml up -d
    ```
 
    Follow [ThingsBoard's installation guide](https://thingsboard.io/docs/installation/docker/)
@@ -57,7 +62,7 @@ Building requires internet access to Docker Hub, PyPI and the PyTorch CPU index.
 
    ```sh
    docker compose -p iot_assignment up -d --build
-   ./init_models.sh
+   ./scripts/init_models.sh
    ```
 
    For CPU-only Ollama, replace the first command with:
@@ -71,14 +76,14 @@ Building requires internet access to Docker Hub, PyPI and the PyTorch CPU index.
 4. Start the bridge and XiaoZhi server:
 
    ```sh
-   docker compose --env-file .env.deploy -f docker-compose.deploy.yml up -d --build
-   docker compose --env-file .env.deploy -f docker-compose.deploy.yml ps
+   docker compose -f docker-compose.deploy.yml up -d --build
+   docker compose -f docker-compose.deploy.yml ps
    ```
 
    Create the first console account (the command prompts for its password):
 
    ```sh
-   docker compose --env-file .env.deploy -f docker-compose.deploy.yml exec platform-bridge python -m platform-bridge.accounts create admin
+   docker compose -f docker-compose.deploy.yml exec platform-bridge python -m platform-bridge.accounts create admin
    ```
 
    `CONSOLE_USERNAME` and `CONSOLE_PASSWORD` above configure the separate native
@@ -88,12 +93,12 @@ Building requires internet access to Docker Hub, PyPI and the PyTorch CPU index.
    Open `http://<HOST_IP>:8005` for the console. The OTA URL for devices is
    `http://<HOST_IP>:8005/xiaozhi/ota/`. The address must be reachable from the
    device, not `localhost`. Set `PUBLIC_WS_URL` and `PUBLIC_OTA_URL` in
-   `.env.deploy` if a proxy or different external port is used.
+   `.env` if a proxy or different external port is used.
 
 5. Check service logs and test the device flow:
 
    ```sh
-   docker compose --env-file .env.deploy -f docker-compose.deploy.yml logs --tail=100 platform-bridge xiaozhi-server
+   docker compose -f docker-compose.deploy.yml logs --tail=100 platform-bridge xiaozhi-server
    ```
 
    For the multi-user provisioning smoke test, create two test accounts and set

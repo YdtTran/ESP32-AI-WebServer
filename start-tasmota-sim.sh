@@ -3,16 +3,18 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-TB_HOST="${TB_HOST:-https://codehelpers.tech}"
+TB_HOST="${TB_HOST:-${THINGSBOARD_HOST:-}}"
+: "${TB_HOST:?Set TB_HOST or THINGSBOARD_HOST in the environment}"
 TB_API_KEY="${TB_API_KEY:?Set TB_API_KEY in the environment}"
-MQTT_HOST="${MQTT_HOST:-broker.emqx.io}"
+MQTT_HOST="${MQTT_HOST:?Set MQTT_HOST in the environment}"
 MQTT_PORT="${MQTT_PORT:-1883}"
-TASMOTA_FULL_TOPIC="${TASMOTA_FULL_TOPIC:-tbch_8x4k/%prefix%/%topic%/}"
+TASMOTA_FULL_TOPIC="${TASMOTA_FULL_TOPIC:-%prefix%/%topic%/}"
+TB_DOWNLINK_CONVERTER_ID="${TB_DOWNLINK_CONVERTER_ID:?Set TB_DOWNLINK_CONVERTER_ID in the environment}"
 SIM_IMAGE="${SIM_IMAGE:-iot-tasmota-sim:local}"
 SIM_DEVICE_A="${SIM_DEVICE_A:-Simulated Tasmota A}"
 SIM_DEVICE_B="${SIM_DEVICE_B:-Simulated Tasmota B}"
 
-# Build simulator image and start two virtual Tasmota relays pointing at broker.emqx.io
+# Build and start two virtual Tasmota relays.
 docker build -f tools/tasmota-simulator.Dockerfile -t "$SIM_IMAGE" .
 
 docker rm -f tasmota-a tasmota-b >/dev/null 2>&1 || true
@@ -32,14 +34,14 @@ docker run -d --name tasmota-b --restart unless-stopped \
   "$SIM_IMAGE"
 
 # Sync downlink converter and register SERVER_SCOPE rpcCapabilities on ThingsBoard
-TB_HOST="$TB_HOST" TB_API_KEY="$TB_API_KEY" SIM_DEVICE_A="$SIM_DEVICE_A" SIM_DEVICE_B="$SIM_DEVICE_B" python3 - <<'PY'
+TB_HOST="$TB_HOST" TB_API_KEY="$TB_API_KEY" TB_DOWNLINK_CONVERTER_ID="$TB_DOWNLINK_CONVERTER_ID" SIM_DEVICE_A="$SIM_DEVICE_A" SIM_DEVICE_B="$SIM_DEVICE_B" python3 - <<'PY'
 import json, os, time, urllib.error, urllib.parse, urllib.request
 
 host = os.environ["TB_HOST"].rstrip("/")
 api_key = os.environ["TB_API_KEY"]
 dev_a = os.environ["SIM_DEVICE_A"]
 dev_b = os.environ["SIM_DEVICE_B"]
-downlink_id = "05971f20-de61-11f1-ab6b-59b019e9ca70"
+downlink_id = os.environ["TB_DOWNLINK_CONVERTER_ID"]
 
 def req(method, path, data=None):
     headers = {

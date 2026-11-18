@@ -12,10 +12,11 @@
 
 Run commands from the repository root unless stated otherwise:
 
-- `docker compose up -d --build` builds and starts the core services; `docker compose -f docker-compose.deploy.yml up -d --build` starts the platform deployment stack.
+- For a new machine, copy `.env.example` to `.env` without overwriting an existing file; set `HOST_IP`, `API_KEY`, and `BRIDGE_SECRET`, plus any integration settings. Follow `docs/reproduce-deployment.md` for models, accounts, CPU-only and ThingsBoard setup.
+- `docker compose -p iot_assignment up -d --build` starts core services on the network required by `docker compose -f docker-compose.deploy.yml up -d --build`. Use `docker-compose.cpu.yml` as an override on machines without NVIDIA GPU support.
 - `cd xiaozhi-console && npm install && npm run dev` starts the frontend development server. Use `npm run build` to type-check and build it.
 - `cd firmware && idf.py build` builds firmware using an installed ESP-IDF and the selected target and configuration.
-- `python3 tests/test_alpha02_provisioning.py` runs the provisioning integration script against the bridge at `localhost:8005`.
+- `python3 tests/test_alpha02_provisioning.py` runs the provisioning integration script against a test bridge at `localhost:8005`; it requires two pre-created test accounts and environment variables listed in the script.
 
 ## Coding Style & Naming Conventions
 
@@ -31,4 +32,4 @@ Recent commits use Conventional Commit-style prefixes, such as `feat(mcp): ...` 
 
 ## Security & Configuration
 
-Keep credentials and device tokens out of commits and logs. Review `.env` files, host addresses, and service ports before deployment; devices must be able to reach the configured platform bridge.
+Keep credentials and device tokens out of commits and logs. Preserve an existing `BRIDGE_SECRET` when moving a deployment, and back up persistent data before migration. The device must reach the bridge at `HOST_IP`; the YOLO UNO firmware has a separate OTA fallback that must be configured and built for the target host because firmware cannot read the host `.env`.

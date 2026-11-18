@@ -35,6 +35,10 @@ Bảng sơ đồ chân I2S cho vi điều khiển YOLO UNO (ESP32-S3), microphon
 
 ## 🏗️ Kiến Trúc Hệ Thống (Architecture)
 
+The diagram below describes the older standalone gateway topology. In the
+platform deployment, the gateway is internal and devices connect through the
+bridge on port 8005.
+
 ```
 [ Thiết bị XiaoZhi ESP32 ]
           │  (WebSocket: Opus Stream)
@@ -45,7 +49,7 @@ Bảng sơ đồ chân I2S cho vi điều khiển YOLO UNO (ESP32-S3), microphon
 ┌─────────────────────────────────────────────────────────────┐
 │  AI UNIFIED GATEWAY (Port 8080)                             │
 │  Base URL: http://<IP_MAY_A>:8080/v1                        │
-│  API Key : sk-xiaozhi-local-secret                          │
+│  API Key : <API_KEY from .env>                          │
 └────────┬──────────────────────┬──────────────────────┬──────┘
          │ /v1/chat/*           │ /v1/audio/transcribe │ /v1/audio/speech
          ▼                      ▼                      ▼
@@ -114,66 +118,66 @@ ESP32-AI-WebServer/
 
 ---
 
-For a fresh platform deployment on another machine, see [Reproduce the local deployment](docs/reproduce-deployment.md).
+## 🚀 Setup on another machine
 
-## 🚀 Khởi Chạy Nhanh (Quick Start)
+The supported deployment uses Linux x86-64, Docker Engine and Docker Compose.
+An NVIDIA GPU and NVIDIA Container Toolkit are optional; use the CPU override
+below without them. The first build and model downloads require internet access
+and several gigabytes of disk space. The deployment builds the XiaoZhi server
+and bridge from this repository.
 
-### Trên Windows:
-1. Đảm bảo **Docker Desktop** đang chạy (icon màu xanh lá).
-2. Double-click chạy file:
-   ```cmd
-   start_all.bat
+1. Clone the repository and configure this machine:
+
+   ```bash
+   git clone https://github.com/YdtTran/ESP32-AI-WebServer.git
+   cd ESP32-AI-WebServer
+   test -e .env || cp .env.example .env
+   chmod 600 .env
    ```
-3. Script sẽ tự khởi chạy container, kiểm tra model và in ra địa chỉ IP LAN cùng mẫu config để dán vào XiaoZhi Server.
-4. **Đàm thoại Real-Time trực tiếp trên Laptop (Rảnh tay 100%):**
-   - Nhấp đúp `run_mic_test.bat` hoặc chạy `python mic_test.py` (cần `pip install sounddevice numpy`).
-   - Tự động cân chỉnh độ ồn nền (VAD), nhớ ngữ cảnh đa lượt (`chat_history`), và stream từng câu từ LLM sang TTS giúp phát âm thanh đầu tiên chỉ sau **~0.66 giây**.
 
-### Trên Linux / macOS:
-```bash
-# 1. Khởi chạy các container
-docker compose up -d --build
+   Edit `.env` and set **`HOST_IP`** to the LAN address reachable by the ESP32,
+   plus independent random values for **`API_KEY`** and **`BRIDGE_SECRET`**.
+   Generate each secret with `openssl rand -hex 32`. Set the ThingsBoard and
+   native dashboard values in `.env` if you use those integrations. Keep `.env`
+   private; when migrating an existing installation, retain its bridge secret.
 
-# 2. Tải model tiếng Việt & LLM
-chmod +x scripts/init_models.sh
-./scripts/init_models.sh
-```
+2. Start the core services and download the models:
 
----
+   ```bash
+   docker compose -p iot_assignment up -d --build
+   ./scripts/init_models.sh
+   ```
 
-## 🔌 Cấu Hình Cho XiaoZhi Server
+   For a CPU-only machine, use this first command instead:
 
-Dán cấu hình sau vào `config.yaml` của **XiaoZhi ESP32 Server**:
+   ```bash
+   docker compose -p iot_assignment -f docker-compose.yml -f docker-compose.cpu.yml up -d --build
+   ```
 
-```yaml
-selected_module:
-  ASR: OpenAIASR
-  LLM: OpenAILLM
-  TTS: OpenAITTS
+3. Start the platform and create a console account:
 
-ASR:
-  OpenAIASR:
-    type: openai
-    base_url: http://<IP_MAY_A>:8080/v1
-    api_key: sk-xiaozhi-local-secret
-    model_name: small
-    language: vi
+   ```bash
+   docker compose -f docker-compose.deploy.yml up -d --build
+   docker compose -f docker-compose.deploy.yml exec platform-bridge python -m platform-bridge.accounts create admin
+   docker compose -f docker-compose.deploy.yml ps
+   ```
 
-LLM:
-  OpenAILLM:
-    type: openai
-    base_url: http://<IP_MAY_A>:8080/v1
-    api_key: sk-xiaozhi-local-secret
-    model_name: qwen2.5:3b-instruct
+   The account command prompts for a password. Open `http://<HOST_IP>:8005` and
+   use `http://<HOST_IP>:8005/xiaozhi/ota/` as the device OTA URL. The `.env`
+   values `CONSOLE_USERNAME` and `CONSOLE_PASSWORD` configure a separate native
+   dashboard login; they do not create the console account.
 
-TTS:
-  OpenAITTS:
-    type: openai
-    api_url: http://<IP_MAY_A>:8080/v1/audio/speech
-    api_key: sk-xiaozhi-local-secret
-    model: tts-1
-    voice: vi_VN-vais1000-medium
-```
+For optional ThingsBoard installation, verification, backups and migration of
+existing data, follow [Reproduce the local deployment](docs/reproduce-deployment.md).
+Model downloads, console accounts, device records and ThingsBoard data are not
+included in a clone. The YOLO UNO firmware still has a machine-specific OTA
+fallback: configure and build the firmware for the target host, then verify on
+hardware. The firmware cannot read the host's `.env` at runtime.
+
+The older Windows scripts and [docs/XIAOZHI_CONFIG.md](docs/XIAOZHI_CONFIG.md) describe a
+separate gateway setup; use the deployment guide above for the platform stack.
+The deployment does not publish the unified gateway on host port 8080; that port
+is used by the optional ThingsBoard service.
 
 ---
 
@@ -190,13 +194,19 @@ TTS:
 
 ## 📚 Tài Liệu Bổ Sung
 
-- [docs/HANDOFF.md](docs/HANDOFF.md): Tài liệu bàn giao kỹ thuật toàn trình.
-- [docs/TASMOTA_THINGSBOARD_HANDOFF.md](docs/TASMOTA_THINGSBOARD_HANDOFF.md): Hướng dẫn kết nối Tasmota ↔ ThingsBoard (2 chiều).
-- [docs/DEPLOY_MACHINE_B.md](docs/DEPLOY_MACHINE_B.md): Hướng dẫn kết nối từ máy Linux làm XiaoZhi Server qua mạng LAN.
-- [docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md): Hướng dẫn đưa toàn bộ cụm AI lên máy ảo AWS EC2 `g4dn.xlarge` kèm SSL WSS.
 - [docs/XIAOZHI_CONFIG.md](docs/XIAOZHI_CONFIG.md): Chi tiết các định dạng cấu hình YAML / JSON.
 
 ---
 
 ## 📄 License
 Dự án được phân phối dưới giấy phép [MIT](LICENSE).
+
+### Native ThingsBoard dashboards
+
+The ThingsBoard IoT page includes a native device view. Configure a separate console account with `CONSOLE_USERNAME` and a strong `CONSOLE_PASSWORD` in the platform bridge environment, then restart the bridge. The deploy Compose file passes these variables from its environment (or `.env`). Do not commit credentials. Console sessions expire after eight hours and are cleared when the bridge restarts.
+
+The native dashboard uses `THINGSBOARD_HOST` and `THINGSBOARD_API_KEY` from `.env`; saved `agent_101` credentials apply when configured for the same host. Device telemetry and server attributes refresh every 15 seconds. Thermostat alarm flags and thresholds can be updated from the console and are saved to ThingsBoard. The dashboard list is read from ThingsBoard; the other dashboard-specific widgets are not yet reproduced. Use HTTPS or a trusted local network because the console account password is sent to the bridge at sign-in.
+
+### Multi-user console
+
+Console accounts are created by the server administrator; new accounts start with empty workspaces. See [Multi-user console and device setup](docs/multi-user-auth.md) for account commands, required bridge secrets, TLS and network routing, and device re-enrollment.

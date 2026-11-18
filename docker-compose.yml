@@ -62,11 +62,16 @@ services:
     environment:
       - TZ=Asia/Ho_Chi_Minh
       - PORT=8008
-      - API_KEY=sk-xiaozhi-local-secret
+      - API_KEY=${API_KEY:?Set API_KEY in .env}
       - OLLAMA_URL=http://ollama:11434
       - OLLAMA_MODEL=qwen2.5:3b-instruct
-      - COREIOT_DEVICE_TOKEN=
-      - MCP_ENDPOINT=
+      - COREIOT_URL=${COREIOT_URL:-}
+      - COREIOT_PUBLIC_ID=${COREIOT_PUBLIC_ID:-}
+      - COREIOT_DASHBOARD_ID=${COREIOT_DASHBOARD_ID:-}
+      - COREIOT_USERNAME=${COREIOT_USERNAME:-}
+      - COREIOT_PASSWORD=${COREIOT_PASSWORD:-}
+      - COREIOT_DEVICE_TOKEN=${COREIOT_DEVICE_TOKEN:-}
+      - MCP_ENDPOINT=${MCP_ENDPOINT:-}
     depends_on:
       - ollama
 
@@ -77,7 +82,7 @@ services:
     container_name: gateway
     restart: unless-stopped
     environment:
-      - API_KEY=sk-xiaozhi-local-secret
+      - API_KEY=${API_KEY:?Set API_KEY in .env}
       - WHISPER_URL=http://faster-whisper:8000
       - PIPER_URL=http://piper-tts:10200
       - OLLAMA_URL=http://ollama:11434

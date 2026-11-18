@@ -164,7 +164,7 @@ plugins:
     # 知识库的描述信息，方便大语言模型知道什么时候调用
     description: "当用户问xxx时，调用本方法，使用知识库中的信息回答问题"
     # ragflow接口配置
-    base_url: "http://192.168.0.8"
+    base_url: ""
     # ragflow api访问令牌
     api_key: "YOUR_CREDENTIAL"
     # ragflow知识库id

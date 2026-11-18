@@ -36,7 +36,7 @@ except ImportError:
     sys.exit(1)
 
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://localhost:8080/v1")
-GATEWAY_KEY = os.environ.get("GATEWAY_KEY", "sk-xiaozhi-local-secret")
+GATEWAY_KEY = os.environ.get("GATEWAY_KEY", os.environ.get("API_KEY", ""))
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen2.5:3b-instruct")
 TTS_VOICE = os.environ.get("TTS_VOICE", "vi_VN-vais1000-medium")
 
