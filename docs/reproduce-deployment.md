@@ -62,7 +62,7 @@ Building requires internet access to Docker Hub, PyPI and the PyTorch CPU index.
 
    ```sh
    docker compose -p iot_assignment up -d --build
-   ./init_models.sh
+   ./scripts/init_models.sh
    ```
 
    For CPU-only Ollama, replace the first command with:

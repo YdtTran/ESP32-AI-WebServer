@@ -72,32 +72,31 @@ bridge on port 8005.
 ## 📁 Cấu Trúc Thư Mục (Project Structure)
 
 ```
-02_tts_stt_model/
+ESP32-AI-WebServer/
 ├── docker-compose.yml          # Điều phối 5 container cơ bản (Ollama, Whisper, Piper, MCP-Gateway, Gateway)
-├── docker-compose.deploy.yml   # Điều phối các dịch vụ Platform (Platform-Bridge, ThingsBoard-MCP)
-├── verify_e2e_deploy.py        # Kiểm thử E2E tự động toàn bộ Platform (Bridge + MCP SSE + WebSocket Handshake)
-├── start_all.bat               # Script 1-Click khởi chạy, tải model và test toàn trình trên Windows
+├── docker-compose.deploy.yml   # Điều phối các dịch vụ Platform (Platform-Bridge, ThingsBoard-MCP, XiaoZhi)
+├── start_all.bat               # Script 1-Click khởi chạy và tải model trên Windows
 ├── run_mic_test.bat            # Script 1-Click bật trợ lý giọng nói Real-Time rảnh tay trên Laptop
 ├── mic_test.py                 # Trợ lý giọng nói Real-Time (Auto VAD + SSE Streaming + Context Memory)
-├── init_models.bat             # Script tải model tiếng Việt & pull Qwen (Windows)
-├── init_models.sh              # Script tải model tiếng Việt & pull Qwen (Linux)
-├── test_pipeline.py            # Script kiểm thử Round-Trip (LLM -> TTS -> STT -> Gateway)
-├── test_mcp_flow.py            # Script kiểm thử tự động MCP Tool Calling & Direct LLM
-├── HANDOFF.md                  # Tài liệu bàn giao kỹ thuật toàn trình (Full System Handoff)
-├── XIAOZHI_CONFIG.md           # Mẫu cấu hình XiaoZhi Server (YAML & JSON)
+├── agent_profile.json          # Cấu hình hồ sơ Agent chia sẻ cho ThingsBoard MCP
 │
+├── scripts/                    # Scripts tiện ích / khởi tạo
+│   ├── init_models.bat         # Script tải model tiếng Việt & pull Qwen (Windows)
+│   └── init_models.sh          # Script tải model tiếng Việt & pull Qwen (Linux)
+├── docs/                       # Toàn bộ tài liệu hướng dẫn, bàn giao & sơ đồ hệ thống
+│   ├── HANDOFF.md              # Tài liệu bàn giao kỹ thuật toàn trình (Full System Handoff)
+│   ├── TASMOTA_THINGSBOARD_HANDOFF.md # Hướng dẫn kết nối Tasmota ↔ ThingsBoard (2 chiều)
+│   ├── XIAOZHI_CONFIG.md       # Mẫu cấu hình XiaoZhi Server (YAML & JSON)
+│   ├── DEPLOY_MACHINE_B.md     # Hướng dẫn kết nối từ máy Linux khác
+│   ├── DEPLOY_AWS.md           # Hướng dẫn đưa toàn bộ hệ thống lên máy chủ AWS EC2
+│   ├── spec-alpha-0.2.md       # Đặc tả kỹ thuật Provisioning Alpha 0.2
+│   └── images/                 # Ảnh chụp màn hình và sơ đồ hệ thống
+├── data/                       # Dữ liệu cấu hình Agent cục bộ (agents.json)
+├── deploy/                     # Cấu hình runtime mount cho Docker deploy (platform-data, xiaozhi-data)
 ├── xiaozhi-console/            # Frontend Web Console (React + TypeScript + Tailwind + Lucide)
 ├── platform-bridge/            # Platform Bridge FastAPI Server (Port 8005) & Embedded Console Dist
 ├── thingsboard-mcp/            # Dedicated ThingsBoard Model Context Protocol (MCP) Server (Port 8009)
 ├── firmware/                   # Mã nguồn C++ ESP32 firmware với platform provisioning & NVS
-├── docs/                       # Tài liệu chi tiết & Đặc tả kỹ thuật (Spec Alpha 0.2, hình ảnh minh họa)
-│   ├── spec-alpha-0.2.md
-│   └── images/                 # Ảnh chụp màn hình và sơ đồ hệ thống
-├── tests/                      # Bộ kiểm thử tự động (Unit & Integration)
-│   ├── test_alpha02_provisioning.py
-│   ├── test_alpha_console_integration.py
-│   ├── test_phase1b_dual_device.py
-│   └── test_virtual_pc_profile.py
 ├── services/                   # Module MCP Agent Gateway & MCP Server
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -146,7 +145,7 @@ and bridge from this repository.
 
    ```bash
    docker compose -p iot_assignment up -d --build
-   ./init_models.sh
+   ./scripts/init_models.sh
    ```
 
    For a CPU-only machine, use this first command instead:
@@ -175,7 +174,7 @@ included in a clone. The YOLO UNO firmware still has a machine-specific OTA
 fallback: configure and build the firmware for the target host, then verify on
 hardware. The firmware cannot read the host's `.env` at runtime.
 
-The older Windows scripts and [XIAOZHI_CONFIG.md](XIAOZHI_CONFIG.md) describe a
+The older Windows scripts and [docs/XIAOZHI_CONFIG.md](docs/XIAOZHI_CONFIG.md) describe a
 separate gateway setup; use the deployment guide above for the platform stack.
 The deployment does not publish the unified gateway on host port 8080; that port
 is used by the optional ThingsBoard service.
@@ -195,7 +194,7 @@ is used by the optional ThingsBoard service.
 
 ## 📚 Tài Liệu Bổ Sung
 
-- [XIAOZHI_CONFIG.md](XIAOZHI_CONFIG.md): Chi tiết các định dạng cấu hình YAML / JSON.
+- [docs/XIAOZHI_CONFIG.md](docs/XIAOZHI_CONFIG.md): Chi tiết các định dạng cấu hình YAML / JSON.
 
 ---
 
