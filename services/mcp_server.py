@@ -16,14 +16,14 @@ except (ImportError, ModuleNotFoundError):
 
 mcp = FastMCP("xiaozhi-thingsboard-tools")
 
-COREIOT_URL = os.getenv("COREIOT_URL", "https://app.coreiot.io").rstrip("/")
-COREIOT_PUBLIC_ID = os.getenv("COREIOT_PUBLIC_ID", "ffd43ad0-776f-11f1-9dee-09c31de14de0")
-COREIOT_DASHBOARD_ID = os.getenv("COREIOT_DASHBOARD_ID", "a14cb550-d8c2-11f1-9298-f795494fee72")
+COREIOT_URL = os.getenv("COREIOT_URL", "").rstrip("/")
+COREIOT_PUBLIC_ID = os.getenv("COREIOT_PUBLIC_ID", "")
+COREIOT_DASHBOARD_ID = os.getenv("COREIOT_DASHBOARD_ID", "")
 COREIOT_USERNAME = os.getenv("COREIOT_USERNAME", "").strip()
 COREIOT_PASSWORD = os.getenv("COREIOT_PASSWORD", "").strip()
-COREIOT_DEVICE_TOKEN = os.getenv("COREIOT_DEVICE_TOKEN", "iqYmkU3CuCQoPtxnaxBm").strip()
+COREIOT_DEVICE_TOKEN = os.getenv("COREIOT_DEVICE_TOKEN", "").strip()
 
-# Persistent HTTP client reuses TLS connections to app.coreiot.io
+# Persistent HTTP client reuses connections to the configured service.
 _http = httpx.Client(
     base_url=COREIOT_URL,
     timeout=10.0,

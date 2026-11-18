@@ -39,7 +39,9 @@ class TestMcpTools(unittest.IsolatedAsyncioTestCase):
         self.mcp = MockMCPServer()
         register_list_devices_tool(self.mcp, self.mock_client)
         register_get_telemetry_tool(self.mcp, self.mock_client)
-        register_send_rpc_tool(self.mcp, self.mock_client)
+        async def execute_action(device, method, params, timeout, two_way):
+            return (await self.mock_client.send_rpc(device, method, params, timeout, two_way)).model_dump()
+        register_send_rpc_tool(self.mcp, self.mock_client, execute_action)
 
     def test_tools_registered(self):
         self.assertIn("list_devices", self.mcp.tools)

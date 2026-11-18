@@ -1,0 +1,6 @@
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices: !reset []

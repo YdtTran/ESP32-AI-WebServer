@@ -6,7 +6,7 @@
   "integrations": {
     "thingsboard": {
       "host": "http://localhost:8080",
-      "api_key": "tb_963y36TYm3j5OwJjAbPiZIifTCHTMB0WBZVstE9DVa9pjN4dB-jK_7gfTAQtm_PczbuaCkqq-e-AuwXNW-kIyQ",
+      "api_key": "",
       "timeout_seconds": 10
     }
   },

@@ -285,6 +285,7 @@ void AudioService::AudioOutputTask() {
 
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
+        playing_ = true;
         audio_queue_cv_.notify_all();
         lock.unlock();
 
@@ -294,6 +295,11 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
         codec_->OutputData(task->pcm);
+
+        lock.lock();
+        playing_ = false;
+        audio_queue_cv_.notify_all();
+        lock.unlock();
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -327,6 +333,7 @@ void AudioService::OpusCodecTask() {
         if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
+            decoding_ = true;
             audio_queue_cv_.notify_all();
             lock.unlock();
 
@@ -351,6 +358,8 @@ void AudioService::OpusCodecTask() {
                 ESP_LOGE(TAG, "Failed to decode audio");
                 lock.lock();
             }
+            decoding_ = false;
+            audio_queue_cv_.notify_all();
             debug_statistics_.decode_count++;
         }
         
@@ -651,6 +660,15 @@ void AudioService::ResetDecoder() {
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
     audio_queue_cv_.notify_all();
+}
+
+void AudioService::WaitForPlayback() {
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    if (!audio_queue_cv_.wait_for(lock, std::chrono::seconds(5), [this]() {
+        return service_stopped_ || (audio_decode_queue_.empty() && audio_playback_queue_.empty() && !decoding_ && !playing_);
+    })) {
+        ESP_LOGW(TAG, "Timed out waiting for audio playback");
+    }
 }
 
 void AudioService::CheckAndUpdateAudioPowerState() {

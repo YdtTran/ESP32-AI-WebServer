@@ -1,10 +1,15 @@
 #include "ota.h"
 #include "system_info.h"
 #include "settings.h"
+#include "sdkconfig.h"
+#ifdef CONFIG_BOARD_TYPE_YOLO_UNO
+#include "boards/yolo-uno/ota_url.h"
+#endif
 #include "assets/lang_config.h"
 
 #include <cJSON.h>
 #include <esp_log.h>
+#include <esp_random.h>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
@@ -43,10 +48,11 @@ Ota::~Ota() {
 std::string Ota::GetCheckVersionUrl() {
     Settings settings("wifi", false);
     std::string url = settings.GetString("ota_url");
-    if (url.empty()) {
-        url = CONFIG_OTA_URL;
-    }
-    return url;
+#ifdef CONFIG_BOARD_TYPE_YOLO_UNO
+    return YoloUnoOtaUrl(url, CONFIG_OTA_URL);
+#else
+    return url.empty() ? CONFIG_OTA_URL : url;
+#endif
 }
 
 std::unique_ptr<Http> Ota::SetupHttp() {
@@ -64,6 +70,23 @@ std::unique_ptr<Http> Ota::SetupHttp() {
     http->SetHeader("User-Agent", user_agent);
     http->SetHeader("Accept-Language", Lang::CODE);
     http->SetHeader("Content-Type", "application/json");
+    Settings platform("platform", true);
+    std::string enrollment_key = platform.GetString("enrollment_key");
+    if (enrollment_key.empty()) {
+        uint8_t random_bytes[32];
+        esp_fill_random(random_bytes, sizeof(random_bytes));
+        char hex[3];
+        for (uint8_t byte : random_bytes) {
+            snprintf(hex, sizeof(hex), "%02x", byte);
+            enrollment_key += hex;
+        }
+        platform.SetString("enrollment_key", enrollment_key);
+    }
+    http->SetHeader("X-Enrollment-Key", enrollment_key.c_str());
+    std::string device_token = platform.GetString("device_token");
+    if (!device_token.empty()) {
+        http->SetHeader("Authorization", ("Bearer " + device_token).c_str());
+    }
 
     return http;
 }
@@ -435,7 +458,6 @@ std::string Ota::GetActivationPayload() {
     cJSON_free(json_str);
     cJSON_Delete(payload);
 
-    ESP_LOGI(TAG, "Activation payload: %s", json.c_str());
     return json;
 }
 
@@ -471,6 +493,27 @@ esp_err_t Ota::Activate() {
         return ESP_FAIL;
     }
 
+    std::string body = http->ReadAll();
+    cJSON* response = cJSON_Parse(body.c_str());
+    cJSON* token = response ? cJSON_GetObjectItem(response, "device_token") : nullptr;
+    cJSON* device = response ? cJSON_GetObjectItem(response, "device_id") : nullptr;
+    cJSON* agent = response ? cJSON_GetObjectItem(response, "agent_id") : nullptr;
+    cJSON* ws_url = response ? cJSON_GetObjectItem(response, "ws_url") : nullptr;
+    if (!cJSON_IsString(token) || !cJSON_IsString(device) || !cJSON_IsString(agent) || !cJSON_IsString(ws_url)) {
+        cJSON_Delete(response);
+        return ESP_FAIL;
+    }
+    {
+        Settings platform("platform", true);
+        platform.SetString("device_token", token->valuestring);
+        platform.SetString("device_id", device->valuestring);
+        platform.SetString("agent_id", agent->valuestring);
+        platform.EraseKey("enrollment_key");
+        Settings websocket("websocket", true);
+        websocket.SetString("url", ws_url->valuestring);
+        websocket.SetString("token", token->valuestring);
+    }
+    cJSON_Delete(response);
     ESP_LOGI(TAG, "Activation successful");
     return ESP_OK;
 }

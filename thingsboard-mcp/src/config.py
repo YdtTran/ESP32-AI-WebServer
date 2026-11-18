@@ -22,6 +22,7 @@ class ThingsBoardConfig(BaseModel):
     password: Optional[str] = Field(default=None, description="Tenant password")
     token: Optional[str] = Field(default=None, description="Existing JWT bearer token")
     timeout_seconds: float = Field(default=10.0, description="HTTP request timeout in seconds")
+    profile_id: Optional[str] = Field(default=None, description="Agent profile isolation key")
 
 
 def _extract_tb_section(profile_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -73,18 +74,19 @@ def resolve_thingsboard_config(
     """
     raw_tb: Dict[str, Any] = {}
     source_name = "none"
+    profile_id = None
+    explicit_source = profile_dict is not None or profile_path is not None
 
     # 1. Profile Dict
-    if profile_dict:
+    if profile_dict is not None:
         extracted = _extract_tb_section(profile_dict)
-        if extracted:
-            raw_tb = extracted
-            source_name = f"profile dict (agent: {profile_dict.get('id', profile_dict.get('name', 'unnamed'))})"
-
-    # 2. Profile File (Explicit, Env Var, or Default)
-    if not raw_tb:
+        raw_tb = extracted if isinstance(extracted, dict) else {}
+        profile_id = str(profile_dict.get('id') or '') or None
+        source_name = f"profile dict (agent: {profile_dict.get('id', profile_dict.get('name', 'unnamed'))})"
+    else:
+        # 2. Profile File (Explicit, Env Var, or Default)
         target_path = profile_path or os.getenv("AGENT_PROFILE_PATH")
-        if not target_path and Path("agent_profile.json").is_file():
+        if not target_path and not explicit_source and Path("agent_profile.json").is_file():
             target_path = "agent_profile.json"
 
         if target_path:
@@ -94,21 +96,35 @@ def resolve_thingsboard_config(
                     with open(p, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     extracted = _extract_tb_section(data)
-                    if extracted:
+                    if isinstance(extracted, dict):
                         raw_tb = extracted
+                        profile_id = str(data.get('id') or Path(target_path).resolve())
                         source_name = f"profile file ({target_path})"
                     else:
                         logger.warning("Profile file %s has no 'integrations.thingsboard' section", target_path)
                 except Exception as e:
                     logger.error("Failed to read agent profile from %s: %s", target_path, e)
 
-    # 3. Fallback to Environment Variables
-    host = raw_tb.get("host") or raw_tb.get("url") or os.getenv("THINGSBOARD_HOST") or os.getenv("TB_HOST")
-    api_key = raw_tb.get("api_key") or raw_tb.get("apiKey") or os.getenv("THINGSBOARD_API_KEY") or os.getenv("TB_API_KEY")
-    username = raw_tb.get("username") or raw_tb.get("email") or os.getenv("THINGSBOARD_USERNAME") or os.getenv("TB_USERNAME")
-    password = raw_tb.get("password") or os.getenv("THINGSBOARD_PASSWORD") or os.getenv("TB_PASSWORD")
-    token = raw_tb.get("token") or raw_tb.get("jwt_token") or os.getenv("THINGSBOARD_TOKEN") or os.getenv("TB_TOKEN")
-    timeout = raw_tb.get("timeout_seconds") or raw_tb.get("timeout") or os.getenv("THINGSBOARD_TIMEOUT", 10.0)
+    # 3. Fallback to Environment Variables only when no explicit profile source was supplied
+    env_fallback = not explicit_source
+    host = raw_tb.get("host") or raw_tb.get("url") or (
+        (os.getenv("THINGSBOARD_HOST") or os.getenv("TB_HOST")) if env_fallback else None
+    )
+    api_key = raw_tb.get("api_key") or raw_tb.get("apiKey") or (
+        (os.getenv("THINGSBOARD_API_KEY") or os.getenv("TB_API_KEY")) if env_fallback else None
+    )
+    username = raw_tb.get("username") or raw_tb.get("email") or (
+        (os.getenv("THINGSBOARD_USERNAME") or os.getenv("TB_USERNAME")) if env_fallback else None
+    )
+    password = raw_tb.get("password") or (
+        (os.getenv("THINGSBOARD_PASSWORD") or os.getenv("TB_PASSWORD")) if env_fallback else None
+    )
+    token = raw_tb.get("token") or raw_tb.get("jwt_token") or (
+        (os.getenv("THINGSBOARD_TOKEN") or os.getenv("TB_TOKEN")) if env_fallback else None
+    )
+    timeout = raw_tb.get("timeout_seconds") or raw_tb.get("timeout") or (
+        os.getenv("THINGSBOARD_TIMEOUT", 10.0) if env_fallback else 10.0
+    )
 
     try:
         timeout_float = float(timeout)
@@ -140,4 +156,5 @@ def resolve_thingsboard_config(
         password=password,
         token=token,
         timeout_seconds=timeout_float,
+        profile_id=profile_id,
     )

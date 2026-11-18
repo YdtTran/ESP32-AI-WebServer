@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, Cpu, Volume2, Laptop, Sparkles, Check, Loader2 } from 'lucide-react';
+import { X, Cpu, Volume2, Sparkles, Check, Loader2 } from 'lucide-react';
 import { useToast } from './Toast';
 import { SupportedLanguage, TRANSLATIONS } from '../i18n';
 import { Agent } from '../types';
@@ -12,7 +12,6 @@ interface AddDeviceModalProps {
   activeAgentId?: string;
   onClose: () => void;
   onDeviceRegistered: () => void;
-  onManualAddDevice: (mac: string, agentId: string, deviceName?: string) => Promise<void>;
 }
 
 export function AddDeviceModal({
@@ -22,32 +21,21 @@ export function AddDeviceModal({
   activeAgentId,
   onClose,
   onDeviceRegistered,
-  onManualAddDevice,
 }: AddDeviceModalProps) {
   const { error, success } = useToast();
   const t = TRANSLATIONS[language];
 
-  // Mode: activation code entry (Method A - Default) vs manual MAC binding (Method B)
-  const [activeTab, setActiveTab] = useState<'activation' | 'manual'>('activation');
-
   // Method A State: User enters 6 digits spoken/printed by ESP32
   const [digits, setDigits] = useState<string[]>(['', '', '', '', '', '']);
-  const [selectedAgentId, setSelectedAgentId] = useState<string>(activeAgentId || (agents[0]?.id || 'agent_101'));
+  const [selectedAgentId, setSelectedAgentId] = useState<string>(activeAgentId || (agents[0]?.id || ''));
   const [deviceName, setDeviceName] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [activatedSuccess, setActivatedSuccess] = useState(false);
 
-  // Method B State: Manual MAC entry
-  const [manualMac, setManualMac] = useState('');
-  const [manualDeviceName, setManualDeviceName] = useState('');
-  const [manualAgentId, setManualAgentId] = useState(activeAgentId || (agents[0]?.id || 'agent_101'));
-  const [manualSubmitting, setManualSubmitting] = useState(false);
-
   useEffect(() => {
     if (open) {
-      const defaultAgent = activeAgentId || agents[0]?.id || 'agent_101';
+      const defaultAgent = activeAgentId || agents[0]?.id || '';
       setSelectedAgentId(defaultAgent);
-      setManualAgentId(defaultAgent);
       setDigits(['', '', '', '', '', '']);
       setDeviceName('');
       setActivatedSuccess(false);
@@ -104,24 +92,6 @@ export function AddDeviceModal({
     }
   };
 
-  const handleManualSubmit = async () => {
-    if (!manualMac.trim()) {
-      error(language === 'vi' ? 'Vui lòng nhập địa chỉ MAC' : 'Please enter MAC address');
-      return;
-    }
-    setManualSubmitting(true);
-    try {
-      await onManualAddDevice(manualMac.trim(), manualAgentId, manualDeviceName.trim() || undefined);
-      setManualMac('');
-      setManualDeviceName('');
-      onClose();
-    } catch (e: any) {
-      error(e.message || 'Binding failed');
-    } finally {
-      setManualSubmitting(false);
-    }
-  };
-
   if (!open) return null;
 
   return (
@@ -141,37 +111,7 @@ export function AddDeviceModal({
           </button>
         </div>
 
-        {/* Tab Switcher */}
-        <div className="grid grid-cols-2 p-1 bg-muted/60 rounded-lg text-xs font-medium">
-          <button
-            type="button"
-            onClick={() => setActiveTab('activation')}
-            className={`flex items-center justify-center gap-1.5 py-1.5 rounded-md transition-all ${
-              activeTab === 'activation'
-                ? 'bg-background text-foreground shadow-xs font-semibold'
-                : 'text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            <Volume2 className="size-3.5 text-primary" />
-            <span>{language === 'vi' ? 'Mã kích hoạt loa/màn hình' : 'Voice/Screen Activation Code'}</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('manual')}
-            className={`flex items-center justify-center gap-1.5 py-1.5 rounded-md transition-all ${
-              activeTab === 'manual'
-                ? 'bg-background text-foreground shadow-xs font-semibold'
-                : 'text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            <Laptop className="size-3.5 text-muted-foreground" />
-            <span>{language === 'vi' ? 'Gán MAC thủ công' : 'Manual MAC Binding'}</span>
-          </button>
-        </div>
-
-        {/* Tab 1: Enter 6-digit Activation Code spoken/printed by ESP32 */}
-        {activeTab === 'activation' && (
-          <div className="space-y-4">
+                  <div className="space-y-4">
             {/* Guide Banner */}
             <div className="rounded-xl border border-primary/20 bg-primary/5 p-3.5 text-xs text-muted-foreground flex gap-2.5 items-start">
               <Volume2 className="size-4 text-primary shrink-0 mt-0.5 animate-pulse" />
@@ -251,61 +191,6 @@ export function AddDeviceModal({
               </div>
             )}
           </div>
-        )}
-
-        {/* Tab 2: Manual MAC Binding (Method B) */}
-        {activeTab === 'manual' && (
-          <div className="space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-foreground">
-                {language === 'vi' ? 'Hồ sơ AI Agent liên kết' : 'Assign to Agent Profile'}
-              </label>
-              <select
-                value={manualAgentId}
-                onChange={e => setManualAgentId(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2 text-xs outline-none focus:ring-2 focus:ring-ring"
-              >
-                {agents.map(a => (
-                  <option key={a.id} value={a.id}>
-                    {a.name} ({a.role})
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-foreground">
-                {language === 'vi' ? 'Địa chỉ MAC thiết bị' : 'Device MAC Address'}
-              </label>
-              <input
-                type="text"
-                value={manualMac}
-                onChange={e => setManualMac(e.target.value)}
-                placeholder="VD: 30:ED:A0:29:54:4C hoặc AA:BB:CC:11:22:33"
-                className="w-full rounded-md border bg-background px-3 py-2 text-xs font-mono outline-none focus:ring-2 focus:ring-ring"
-              />
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-xs font-medium text-foreground">
-                {t.addDeviceModal.agentNameLabel}
-              </label>
-              <input
-                type="text"
-                value={manualDeviceName}
-                onChange={e => setManualDeviceName(e.target.value)}
-                placeholder={t.addDeviceModal.agentNamePlaceholder}
-                className="w-full rounded-md border bg-background px-3 py-2 text-xs outline-none focus:ring-2 focus:ring-ring"
-              />
-            </div>
-
-            <p className="text-[11px] text-muted-foreground">
-              {language === 'vi'
-                ? '* Chế độ gán MAC thủ công được duy trì cho mục đích phát triển, kiểm thử ảo (Virtual PC) và quản trị viên.'
-                : '* Manual MAC binding is preserved for development, virtual testing nodes, and administrative overrides.'}
-            </p>
-          </div>
-        )}
 
         {/* Action Buttons */}
         <div className="flex justify-end gap-3 pt-3 border-t">
@@ -317,11 +202,10 @@ export function AddDeviceModal({
             {t.addDeviceModal.cancel}
           </button>
 
-          {activeTab === 'activation' && (
             <button
               type="button"
               onClick={handleActivateByCode}
-              disabled={submitting || digits.join('').length !== 6 || activatedSuccess}
+              disabled={submitting || !selectedAgentId || digits.join('').length !== 6 || activatedSuccess}
               className="rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50 flex items-center gap-1.5"
             >
               {submitting ? (
@@ -336,18 +220,7 @@ export function AddDeviceModal({
                 </>
               )}
             </button>
-          )}
 
-          {activeTab === 'manual' && (
-            <button
-              type="button"
-              onClick={handleManualSubmit}
-              disabled={manualSubmitting || !manualMac.trim()}
-              className="rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            >
-              {manualSubmitting ? (language === 'vi' ? 'Đang gán...' : 'Binding...') : t.addDeviceModal.submit}
-            </button>
-          )}
         </div>
 
       </div>

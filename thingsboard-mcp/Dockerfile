@@ -5,6 +5,7 @@ WORKDIR /app
 
 # Copy application files
 COPY . /app
+RUN pip install --no-cache-dir -r requirements.txt
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \

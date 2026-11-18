@@ -38,6 +38,8 @@ class TestMcpProtocolStdio(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         if os.path.exists(self.tmp_profile.name):
             os.remove(self.tmp_profile.name)
+        if os.path.exists(self.tmp_profile.name + '.sqlite3'):
+            os.remove(self.tmp_profile.name + '.sqlite3')
 
     async def test_full_mcp_session_lifecycle(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,7 +50,8 @@ class TestMcpProtocolStdio(unittest.IsolatedAsyncioTestCase):
             env={
                 **os.environ,
                 "PYTHONPATH": project_root,
-                "LOG_LEVEL": "WARNING"
+                "LOG_LEVEL": "WARNING",
+                "TB_CAPABILITY_DB": self.tmp_profile.name + '.sqlite3'
             }
         )
 
@@ -64,6 +67,9 @@ class TestMcpProtocolStdio(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("list_devices", tool_names)
                 self.assertIn("get_telemetry", tool_names)
                 self.assertIn("send_rpc", tool_names)
+                for name in ('discover_capabilities', 'list_available_rpc',
+                             'get_platform_summary', 'execute_device_action'):
+                    self.assertIn(name, tool_names)
 
                 # 3. Call list_devices
                 call_list = await session.call_tool("list_devices", {"page_size": 5})

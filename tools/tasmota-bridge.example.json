@@ -1,0 +1,21 @@
+{
+  "devices": {
+    "relay-a": {
+      "name": "Simulated Tasmota A",
+      "type": "default",
+      "methods": {
+        "setPower": {"command": "POWER", "parameter": "state", "values": {"true": "ON", "false": "OFF"}},
+        "getPower": {"command": "POWER", "payload": ""},
+        "togglePower": {"command": "POWER", "payload": "TOGGLE"}
+      }
+    },
+    "relay-b": {
+      "name": "Simulated Tasmota B",
+      "type": "default",
+      "methods": {
+        "setPower": {"command": "POWER", "parameter": "state", "values": {"true": "ON", "false": "OFF"}},
+        "getPower": {"command": "POWER", "payload": ""}
+      }
+    }
+  }
+}

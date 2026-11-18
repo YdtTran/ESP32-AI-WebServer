@@ -7,12 +7,11 @@ import json
 import logging
 from typing import Any, Optional, Union
 from ..client import ThingsBoardClient, ThingsBoardError
-from ..schemas import SendRpcResult
 
 logger = logging.getLogger("thingsboard_mcp.tools.rpc")
 
 
-def register_send_rpc_tool(mcp_server, client: ThingsBoardClient):
+def register_send_rpc_tool(mcp_server, client: ThingsBoardClient, execute_action):
     """Register send_rpc tool with MCP Server."""
 
     @mcp_server.tool()
@@ -47,14 +46,7 @@ def register_send_rpc_tool(mcp_server, client: ThingsBoardClient):
             device_identifier, method, two_way, timeout_ms
         )
         try:
-            result: SendRpcResult = await client.send_rpc(
-                device_identifier=device_identifier,
-                method=method,
-                params=params,
-                timeout_ms=timeout_ms,
-                two_way=two_way,
-            )
-            return result.model_dump_json(indent=2)
+            return json.dumps(await execute_action(device_identifier, method, params, timeout_ms, two_way), indent=2)
         except ThingsBoardError as e:
             logger.error("ThingsBoard error in send_rpc: %s", e)
             return json.dumps({

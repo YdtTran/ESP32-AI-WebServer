@@ -29,6 +29,7 @@ class TestThingsBoardConfig(unittest.TestCase):
         self.assertEqual(cfg.host, "http://192.168.1.100:8080")
         self.assertEqual(cfg.api_key, "tb_test_key_12345")
         self.assertEqual(cfg.timeout_seconds, 15.0)
+        self.assertEqual(cfg.profile_id, 'agent_test')
 
     def test_resolve_from_nested_config_profile_dict(self):
         profile = {
@@ -91,6 +92,13 @@ class TestThingsBoardConfig(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 resolve_thingsboard_config(profile_dict=no_auth_profile)
             self.assertIn("credentials not found in active Agent Profile", str(ctx.exception))
+
+    def test_profile_dict_does_not_leak_file_or_env_credentials(self):
+        incomplete_profile = {"id": "agent-incomplete", "integrations": {"thingsboard": {"host": "http://agent.test"}}}
+        with patch.dict(os.environ, {"TB_HOST": "http://env.test", "TB_API_KEY": "env-secret"}, clear=True):
+            with self.assertRaises(ValueError) as ctx:
+                resolve_thingsboard_config(profile_dict=incomplete_profile)
+            self.assertIn("credentials not found", str(ctx.exception))
 
 
 if __name__ == "__main__":

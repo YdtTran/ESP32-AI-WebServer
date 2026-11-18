@@ -4,20 +4,31 @@ Provides the upstream manager-api endpoints, resolves Agent Profiles dynamically
 and coordinates ThingsBoard MCP integration.
 """
 
+import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import secrets
+import uuid
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from urllib.parse import unquote, urlsplit
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
+from starlette.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .store import platform_store, normalize_mac
+from .store import PlatformStore, platform_store, normalize_mac
+from .accounts import AccountStore
+from . import agent_api_tools
+from .dashboard_integration import router as dashboard_router
 try:
     from .device_db import device_db
 except ImportError:
@@ -31,18 +42,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("platform_bridge")
 
-SECRET_KEY = os.getenv("BRIDGE_SECRET", "sk-xiaozhi-local-secret").strip()
+SECRET_KEY = os.getenv("BRIDGE_SECRET", "").strip()
 
 # Internal service URLs
 WHISPER_URL = os.getenv("WHISPER_URL", "http://faster-whisper:8000/v1/audio/transcriptions")
 PIPER_URL = os.getenv("PIPER_URL", "http://piper-tts:10200/v1/audio/speech")
 LLM_GATEWAY_URL = os.getenv("LLM_GATEWAY_URL", "http://mcp-gateway:8008/v1")
-WS_PUBLIC_PORT = int(os.getenv("WS_PUBLIC_PORT", "8002"))
-HOST_IP = os.getenv("HOST_IP", "192.168.1.7")
-if HOST_IP in ("127.0.0.1", "localhost", "0.0.0.0"):
-    HOST_IP = "192.168.1.7"
+WS_PUBLIC_PORT = int(os.getenv("WS_PUBLIC_PORT", "8005"))
+HOST_IP = os.getenv("HOST_IP", "localhost")
+PUBLIC_WS_URL = os.getenv('PUBLIC_WS_URL', f'ws://{HOST_IP}:{WS_PUBLIC_PORT}/xiaozhi/v1/')
+PUBLIC_OTA_URL = os.getenv('PUBLIC_OTA_URL', f'http://{HOST_IP}:8005/xiaozhi/ota/')
 
 app = FastAPI(title="XiaoZhi Platform Management Bridge", version="1.0.0")
+accounts = AccountStore()
+app.include_router(dashboard_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,15 +65,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount Virtual PC Web Tester static client
-STATIC_TEST_DIR = Path(__file__).resolve().parent / "static_test"
-if STATIC_TEST_DIR.exists():
-    app.mount("/test", StaticFiles(directory=str(STATIC_TEST_DIR), html=True), name="static_test")
-
-
-@app.get("/pc-test")
-async def redirect_to_pc_test():
-    return RedirectResponse(url="/test/test_page.html")
+@app.middleware('http')
+async def protect_pending_management_routes(request: Request, call_next):
+    path = request.url.path
+    pending = (path in {'/api/devices/bind',
+                        }
+               or path.startswith('/api/native-dashboards'))
+    if pending:
+        try:
+            console_user(request.headers.get('authorization'))
+        except HTTPException:
+            return JSONResponse({'detail': 'Invalid or expired session'}, status_code=401)
+        return JSONResponse({'detail': 'This feature is temporarily unavailable'}, status_code=503)
+    return await call_next(request)
 
 
 # Mount Built AI Agent Management Console (Alpha 0.1)
@@ -106,22 +123,17 @@ async def root_index():
 
 
 def verify_secret(authorization: Optional[str] = Header(None)):
-    if not SECRET_KEY:
-        return
-    if not authorization:
-        # Allow open access if bridge is in dev mode or secret not strictly enforced
-        return
-    token = authorization.replace("Bearer ", "").strip()
-    if token != SECRET_KEY and token != "sk-local":
-        logger.warning("Unauthorized request with token: %s", token[:6] + "...")
+    token = authorization[7:].strip() if authorization and authorization.startswith('Bearer ') else ''
+    if not SECRET_KEY or not secrets.compare_digest(token, SECRET_KEY):
+        raise HTTPException(status_code=401, detail='Invalid service credential')
 
 
 # ==============================================================================
 # 1. XiaoZhi manager-api Contract Endpoints (read_config_from_api: true)
 # ==============================================================================
 
-@app.post("/xiaozhi/config/server-base")
-@app.post("/config/server-base")
+@app.post("/xiaozhi/config/server-base", dependencies=[Depends(verify_secret)])
+@app.post("/config/server-base", dependencies=[Depends(verify_secret)])
 async def get_server_base_config():
     """Returns the baseline service configuration for ASR, TTS, VAD, and LLM."""
     logger.info("Serving /config/server-base to XiaoZhi runtime")
@@ -205,7 +217,7 @@ async def get_server_base_config():
                 "OpenAILLM": {
                     "type": "openai",
                     "base_url": LLM_GATEWAY_URL,
-                    "api_key": SECRET_KEY,
+                    "api_key": os.getenv("API_KEY", ""),
                     "model_name": "qwen2.5:3b-instruct"
                 }
             },
@@ -223,14 +235,20 @@ async def get_server_base_config():
     }
 
 
+def response_prompt(agent: Dict[str, Any], prompt: str) -> str:
+    language = {"en": "English", "vi": "Vietnamese"}.get(agent.get("language"), "Vietnamese")
+    return (f"{prompt}\n\nRespond in {language}. This response language takes precedence "
+            "over conflicting persona instructions, unless the user explicitly requests another language.")
+
+
 class AgentModelsRequest(BaseModel):
     macAddress: Optional[str] = None
     clientId: Optional[str] = None
     selectedModule: Optional[Dict[str, Any]] = None
 
 
-@app.post("/xiaozhi/config/agent-models")
-@app.post("/config/agent-models")
+@app.post("/xiaozhi/config/agent-models", dependencies=[Depends(verify_secret)])
+@app.post("/config/agent-models", dependencies=[Depends(verify_secret)])
 async def get_agent_models(req: AgentModelsRequest):
     """
     Resolves the active Agent Profile and ThingsBoard context for the connecting device.
@@ -239,26 +257,12 @@ async def get_agent_models(req: AgentModelsRequest):
     mac = req.macAddress or req.clientId or "default"
     logger.info("Resolving agent models for MAC: %s (client_id: %s)", mac, req.clientId)
 
-    agent = platform_store.get_agent_for_device(mac)
-
-    # If device is not explicitly bound, fallback to default active agent
+    device = device_db.get_device_by_mac(normalize_mac(mac))
+    agent = accounts.get_agent_by_id(device['agent_id']) if device else None
     if not agent:
-        agents = platform_store.list_agents()
-        if agents:
-            agent = agents[0]
-            logger.info("Auto-binding unassigned device %s to default agent: %s", mac, agent["name"])
-            platform_store.bind_device(mac, agent["id"], "Auto-Discovered Device")
-        else:
-            return {"code": 10041, "msg": f"Device {mac} not registered"}
+        return {"code": 10041, "msg": f"Device {mac} not registered"}
 
-    # Export active agent profile to agent_profile.json so thingsboard-mcp has credentials
-    shared_profile_path = os.getenv("SHARED_AGENT_PROFILE_PATH", "/app/agent_profile.json")
-    try:
-        platform_store.sync_to_agent_profile_json(agent["id"], shared_profile_path)
-    except Exception as e:
-        logger.warning("Could not sync agent profile to %s: %s", shared_profile_path, e)
-
-    prompt = agent.get("prompt", "")
+    prompt = response_prompt(agent, agent.get("prompt", ""))
     tts_voice = agent.get("tts", {}).get("voice", "vi_VN-vais1000-medium")
     if tts_voice in ("vi_female_linh", "female", "male", "default", "standard"):
         tts_voice = "vi_VN-vais1000-medium"
@@ -285,7 +289,7 @@ async def get_agent_models(req: AgentModelsRequest):
             "LLM": {
                 "OpenAILLM": {
                     "type": "openai",
-                    "base_url": LLM_GATEWAY_URL,
+                    "base_url": f"{os.getenv('BRIDGE_INTERNAL_URL', 'http://platform-bridge:8005').rstrip('/')}/api/agents/{agent['id']}/v1",
                     "api_key": SECRET_KEY,
                     "model_name": agent_model
                 }
@@ -308,17 +312,19 @@ class ChatReportRequest(BaseModel):
     audioBase64: Optional[str] = None
 
 
-@app.post("/xiaozhi/agent/chat-history/report")
-@app.post("/agent/chat-history/report")
+@app.post("/xiaozhi/agent/chat-history/report", dependencies=[Depends(verify_secret)])
+@app.post("/agent/chat-history/report", dependencies=[Depends(verify_secret)])
 async def report_chat_history(req: ChatReportRequest):
     """Stores conversation transcript chunks reported by the XiaoZhi runtime."""
     if req.macAddress and req.content:
-        platform_store.record_chat(
-            mac_address=req.macAddress,
-            session_id=req.sessionId or "default_session",
-            chat_type=req.chatType or 1,
-            content=req.content
-        )
+        mac = normalize_mac(req.macAddress)
+        device = device_db.get_device_by_mac(mac)
+        if device:
+            accounts.append_chat(device['agent_id'], {
+                'session_id': req.sessionId or 'default_session', 'mac': mac,
+                'role': 'assistant' if req.chatType == 2 else 'user',
+                'content': req.content, 'timestamp': int(time.time()),
+            })
     return {"code": 0, "msg": "success"}
 
 
@@ -339,6 +345,42 @@ async def save_chat_summary(session_id: str):
 # 3. Platform Management APIs
 # ==============================================================================
 
+class LoginRequest(BaseModel):
+    username: str = Field(max_length=128)
+    password: str = Field(max_length=1024)
+
+
+def console_user(authorization: Optional[str]) -> str:
+    token = authorization[7:].strip() if authorization and authorization.startswith('Bearer ') else ''
+    username = accounts.session_user(token)
+    if not username:
+        raise HTTPException(status_code=401, detail='Invalid or expired session')
+    return username
+
+
+@app.post('/api/auth/login')
+async def console_login(body: LoginRequest, request: Request):
+    address = request.client.host if request.client else 'unknown'
+    if not accounts.record_attempt(f'login:{address}'):
+        raise HTTPException(status_code=429, detail='Too many login attempts')
+    token = await run_in_threadpool(accounts.login, body.username, body.password)
+    if not token:
+        raise HTTPException(status_code=401, detail='Invalid credentials')
+    return {'token': token}
+
+
+@app.get('/api/auth/me')
+async def console_me(authorization: Optional[str] = Header(None)):
+    return {'username': console_user(authorization)}
+
+
+@app.post('/api/auth/logout')
+async def console_logout(authorization: Optional[str] = Header(None)):
+    console_user(authorization)
+    accounts.logout(authorization[7:].strip())
+    return {'status': 'ok'}
+
+
 @app.get("/api/health")
 async def health_check():
     return {
@@ -348,49 +390,91 @@ async def health_check():
     }
 
 
-@app.get("/api/agents")
-async def list_agents():
-    """Returns all configured agents with masked credentials for the frontend console."""
-    return {"agents": platform_store.list_safe_agents()}
+def validate_thingsboard_origin(host: str) -> str:
+    try:
+        parsed = urlsplit(host)
+        if (parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username is not None or
+                parsed.password is not None or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+            raise ValueError
+        port = parsed.port
+        hostname = parsed.hostname.lower()
+        if ':' in hostname:
+            hostname = f'[{hostname}]'
+        origin = f'{parsed.scheme}://{hostname}' + (f':{port}' if port is not None else '')
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail='Invalid ThingsBoard origin')
+    allowed = {value.strip().rstrip('/').lower() for value in os.getenv('THINGSBOARD_ALLOWED_ORIGINS', '').split(',') if value.strip()}
+    if origin not in allowed:
+        raise HTTPException(status_code=400, detail='ThingsBoard origin is not allowed')
+    return origin
 
 
-@app.get("/api/agents/{agent_id}")
-async def get_agent_endpoint(agent_id: str):
-    agent = platform_store.get_agent(agent_id)
+def validate_agent_integration(payload: Dict[str, Any]):
+    config = payload.get('config') or {}
+    if not isinstance(config, dict):
+        raise HTTPException(status_code=400, detail='Invalid configuration')
+    for integrations in (payload.get('integrations'), config.get('integrations')):
+        if integrations is None:
+            continue
+        if not isinstance(integrations, dict) or not isinstance(integrations.get('thingsboard', {}), dict):
+            raise HTTPException(status_code=400, detail='Invalid integration')
+        host = integrations.get('thingsboard', {}).get('host')
+        if host:
+            validate_thingsboard_origin(host)
+
+
+
+def user_store(authorization: Optional[str]) -> PlatformStore:
+    return PlatformStore(accounts, console_user(authorization))
+
+
+def owned_agent(store: PlatformStore, agent_id: str):
+    agent = store.get_agent(agent_id)
     if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    # Return formatted safe agent
-    for safe in platform_store.list_safe_agents():
-        if safe["id"] == agent_id:
-            return safe
+        raise HTTPException(status_code=404, detail='Agent not found')
     return agent
 
 
+@app.get("/api/agents")
+async def list_agents(authorization: Optional[str] = Header(None)):
+    return {"agents": user_store(authorization).list_safe_agents()}
+
+
+@app.get("/api/agents/{agent_id}")
+async def get_agent_endpoint(agent_id: str, authorization: Optional[str] = Header(None)):
+    store = user_store(authorization)
+    owned_agent(store, agent_id)
+    return next(agent for agent in store.list_safe_agents() if agent['id'] == agent_id)
+
+
 @app.post("/api/agents")
-async def create_agent_endpoint(payload: Dict[str, Any]):
-    try:
-        new_agent = platform_store.create_agent(payload)
-        return {"status": "success", "agent": new_agent}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+async def create_agent_endpoint(payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    store = user_store(authorization)
+    validate_agent_integration(payload)
+    payload = {**payload, 'id': 'agent_' + uuid.uuid4().hex}
+    new_agent = store.create_agent(payload)
+    return {"status": "success", "agent": next(agent for agent in store.list_safe_agents() if agent['id'] == new_agent['id'])}
 
 
 @app.put("/api/agents/{agent_id}")
-async def update_agent_endpoint(agent_id: str, payload: Dict[str, Any]):
+async def update_agent_endpoint(agent_id: str, payload: Dict[str, Any], authorization: Optional[str] = Header(None)):
+    store = user_store(authorization)
+    owned_agent(store, agent_id)
+    validate_agent_integration(payload)
     try:
-        updated = platform_store.update_agent(agent_id, payload)
-        return {"status": "success", "message": f"Updated agent {agent_id}"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        store.update_agent(agent_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "success", "message": f"Updated agent {agent_id}"}
 
 
 @app.delete("/api/agents/{agent_id}")
-async def delete_agent_endpoint(agent_id: str):
-    try:
-        platform_store.delete_agent(agent_id)
-        return {"status": "success", "message": f"Deleted agent {agent_id}"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+async def delete_agent_endpoint(agent_id: str, authorization: Optional[str] = Header(None)):
+    store = user_store(authorization)
+    owned_agent(store, agent_id)
+    device_db.revoke_agent_devices(agent_id)
+    store.delete_agent(agent_id)
+    return {"status": "success", "message": f"Deleted agent {agent_id}"}
 
 
 class AgentChatRequest(BaseModel):
@@ -399,72 +483,39 @@ class AgentChatRequest(BaseModel):
 
 
 @app.post("/api/agents/{agent_id}/chat")
-async def agent_chat_endpoint(agent_id: str, req: AgentChatRequest):
-    """Executes real LLM inference with ThingsBoard tool-calling for the Web Console."""
-    agent = platform_store.get_agent(agent_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
+async def agent_chat_endpoint(agent_id: str, req: AgentChatRequest, authorization: Optional[str] = Header(None)):
+    agent = owned_agent(user_store(authorization), agent_id)
+    return await run_agent_chat(agent, req)
 
+
+async def run_agent_chat(agent: Dict[str, Any], req: AgentChatRequest):
+    """Executes inference using only the selected agent's configuration."""
     user_text = req.message.strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="Empty message")
-
-    shared_profile_path = os.getenv("SHARED_AGENT_PROFILE_PATH", "/app/agent_profile.json")
-    try:
-        platform_store.sync_to_agent_profile_json(agent_id, shared_profile_path)
-    except Exception as e:
-        logger.warning("Could not sync agent profile: %s", e)
 
     prompt = agent.get("prompt") or (
         f"Bạn là {agent.get('name', 'Nova')}, trợ lý giọng nói thông minh cho gia đình. "
         "Trả lời bằng tiếng Việt ngắn gọn, súc tích (1-2 câu), tự nhiên."
     )
+    prompt = response_prompt(agent, prompt)
     model_name = agent.get("llm", {}).get("model", "qwen2.5:3b-instruct")
 
-    tb_tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "list_devices",
-                "description": "List all IoT devices, sensors, and actuators connected to ThingsBoard.",
-                "parameters": {"type": "object", "properties": {}}
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_telemetry",
-                "description": "Query current environmental or sensor telemetry (temperature, humidity, CO2, etc.) for a device.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "device_name": {
-                            "type": "string",
-                            "description": "Name of the target ThingsBoard device, e.g. Test Device A1 or Virtual-Environmental-Monitor"
-                        }
-                    },
-                    "required": ["device_name"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "send_rpc",
-                "description": "Send a control command / RPC action (turn on, turn off, toggle, set state) to an actuator device.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "device_name": {"type": "string", "description": "Name of the target device"},
-                        "method": {"type": "string", "description": "RPC method name, e.g. setLight, setPower"},
-                        "params": {"type": "string", "description": "Command parameters as JSON string, e.g. {\"state\": true}"}
-                    },
-                    "required": ["device_name", "method"]
-                }
-            }
-        }
+    tb_tools = list(agent_api_tools.MCP_TOOLS) + list(agent_api_tools.TOOLS) + [
+        {"type": "function", "function": {
+            "name": "get_current_time",
+            "description": "Get the current local date and time.",
+            "parameters": {"type": "object", "properties": {}},
+        }}
     ]
-
+    prompt += ("\nComplete the request in this response. Use the available ThingsBoard MCP tools "
+               "for live data and control; never say you are waiting without calling a tool. "
+               "If a tool fails, explain the failure instead of inventing data or success. "
+               "Only send RPC when the user explicitly requests a device action; do not guess the device, method, or parameters. "
+               "Before controlling a device, call list_devices and list_available_rpc (or discover_capabilities) "
+               "and use only registered methods and schema-valid parameters via execute_device_action or send_rpc. "
+               "If device lookup fails, use the returned device list to identify the exact device. "
+               "Never repeat an RPC after it was sent and failed or timed out without the user requesting another attempt.")
     messages = [{"role": "system", "content": prompt}]
     for h in (req.history or [])[-6:]:
         r = h.get("role")
@@ -477,138 +528,152 @@ async def agent_chat_endpoint(agent_id: str, req: AgentChatRequest):
     ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 
     tb_conf = agent.get("integrations", {}).get("thingsboard", {})
-    tb_host = (tb_conf.get("host") or os.getenv("THINGSBOARD_HOST", "https://codehelpers.tech")).rstrip("/")
-    tb_key = tb_conf.get("api_key") or os.getenv("THINGSBOARD_API_KEY", "tb_G5TSH2WJsF3g25Q_7jImZwyUpdAYqGtI6cT86c-dMCKy_d8WZ3M3rNjn9zhzOT5Y9AnvV-KKQPpIQChD7qPluA")
+    tb_host = (tb_conf.get("host") or "").rstrip("/")
+    tb_key = tb_conf.get("api_key") or ""
+    if tb_host and tb_key:
+        tb_host = validate_thingsboard_origin(tb_host)
     tb_headers = {"User-Agent": "XiaoZhi-Platform/1.0", "X-Authorization": f"ApiKey {tb_key}"}
 
     executed_tools = []
 
+    validated_tb_conf = {**tb_conf, "host": tb_host, "api_key": tb_key}
+    allowed_tb_tools = {t["function"]["name"] for t in agent_api_tools.MCP_TOOLS + agent_api_tools.TOOLS}
+
     async def execute_tool(tool_name: str, args_dict: Dict[str, Any]) -> str:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            if tool_name == "list_devices":
-                url = f"{tb_host}/api/tenant/devices?pageSize=10&page=0"
-                resp = await client.get(url, headers=tb_headers)
-                if resp.status_code == 200:
-                    raw_devs = resp.json().get("data", [])
-                    res = [{"name": d.get("name"), "type": d.get("type"), "id": d.get("id", {}).get("id")} for d in raw_devs]
-                    return json.dumps({"status": "success", "devices": res}, ensure_ascii=False)
-                return json.dumps({"status": "error", "message": f"ThingsBoard HTTP {resp.status_code}"})
-
-            elif tool_name == "get_telemetry":
-                dev_name = args_dict.get("device_name", "").strip()
-                url = f"{tb_host}/api/tenant/devices?pageSize=20&page=0"
-                resp = await client.get(url, headers=tb_headers)
-                if resp.status_code == 200:
-                    data = resp.json().get("data", [])
-                    matched = next((d for d in data if d.get("name", "").lower() == dev_name.lower()), None)
-                    if not matched and data:
-                        matched = data[0]
-                    if matched:
-                        dev_id = matched["id"]["id"]
-                        tel_url = f"{tb_host}/api/plugins/telemetry/DEVICE/{dev_id}/values/timeseries"
-                        tel_resp = await client.get(tel_url, headers=tb_headers)
-                        if tel_resp.status_code == 200:
-                            tel_data = tel_resp.json()
-                            summary = {k: v[0].get("value") for k, v in tel_data.items() if v}
-                            return json.dumps({"device": matched.get("name"), "telemetry": summary}, ensure_ascii=False)
-                return json.dumps({"status": "error", "message": f"Device '{dev_name}' telemetry not found"})
-
-            elif tool_name == "send_rpc":
-                policy = agent.get("tool_policy", "full_control")
-                if policy == "read_only_telemetry":
-                    return json.dumps({"status": "forbidden", "message": "Policy violation: Agent has read-only access and cannot send RPC commands."})
-                dev_name = args_dict.get("device_name", "").strip()
-                method = args_dict.get("method", "setState")
-                params = args_dict.get("params", "{}")
-                url = f"{tb_host}/api/tenant/devices?pageSize=20&page=0"
-                resp = await client.get(url, headers=tb_headers)
-                if resp.status_code == 200:
-                    data = resp.json().get("data", [])
-                    matched = next((d for d in data if d.get("name", "").lower() == dev_name.lower()), None)
-                    if matched:
-                        dev_id = matched["id"]["id"]
-                        rpc_url = f"{tb_host}/api/plugins/rpc/oneway/{dev_id}"
-                        try:
-                            rpc_params = json.loads(params) if isinstance(params, str) else params
-                        except Exception:
-                            rpc_params = {"command": params}
-                        rpc_resp = await client.post(rpc_url, json={"method": method, "params": rpc_params}, headers=tb_headers)
-                        return json.dumps({"status": "success", "device": dev_name, "method": method, "response_code": rpc_resp.status_code})
-                return json.dumps({"status": "error", "message": f"Device '{dev_name}' not found for RPC"})
-
+        if tool_name == "get_current_time":
+            return json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S %Z")})
+        if tool_name not in allowed_tb_tools:
             return json.dumps({"status": "error", "message": f"Unknown tool: {tool_name}"})
+        if not tb_host or not tb_key:
+            return json.dumps({"status": "error", "message": "ThingsBoard host or API key is not configured."})
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            if tool_name in ("thingsboard_get", "thingsboard_rpc"):
+                args_dict = dict(args_dict)
+                path = args_dict.get("path", "") if tool_name == "thingsboard_get" else ""
+                match = re.match(r"^(/api/plugins/telemetry/DEVICE/)([^/?]+)(/.*)$", path) if isinstance(path, str) else None
+                identifier = unquote(match.group(2)) if match else args_dict.get("device_id", "") if tool_name == "thingsboard_rpc" else ""
+                if identifier:
+                    try:
+                        uuid.UUID(identifier)
+                    except (ValueError, TypeError, AttributeError):
+                        devices = await agent_api_tools._all_devices(client, tb_host, tb_headers)
+                        device = agent_api_tools._matching_device(devices, identifier)
+                        if not device:
+                            return json.dumps({"status": "error", "message": f"Device '{identifier}' not found or name is ambiguous"})
+                        device_id = device["id"]["id"]
+                        if match:
+                            args_dict["path"] = match.group(1) + device_id + match.group(3)
+                        else:
+                            args_dict["device_id"] = device_id
+            result = await agent_api_tools.execute(
+                client, validated_tb_conf, tool_name, args_dict,
+                read_only=agent.get("tool_policy") == "read_only_telemetry",
+                profile_id=agent.get("id"),
+            )
+            return json.dumps(result, ensure_ascii=False)
 
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
-            t1_resp = await client.post(
-                f"{ollama_url}/v1/chat/completions",
-                json={
-                    "model": model_name,
-                    "messages": messages,
-                    "tools": tb_tools,
-                    "stream": False
-                }
-            )
-            t1_resp.raise_for_status()
-            t1_data = t1_resp.json()
-
-            choice = t1_data.get("choices", [{}])[0]
-            msg = choice.get("message", {})
-            tool_calls = msg.get("tool_calls") or []
-
-            if not tool_calls:
-                content = msg.get("content", "").strip()
-                if not content:
-                    fb_resp = await client.post(
-                        f"{ollama_url}/v1/chat/completions",
-                        json={"model": model_name, "messages": messages, "stream": False}
-                    )
-                    content = fb_resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-                return {"reply": content, "tool_calls": []}
-
-            t2_messages = list(messages)
-            t2_messages.append(msg)
-
-            for tc in tool_calls:
-                fn = tc.get("function", {})
-                tc_id = tc.get("id", "call_default")
-                fn_name = fn.get("name", "")
-                raw_args = fn.get("arguments", "{}")
-                try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                except Exception:
-                    args = {}
-
-                tool_res_str = await execute_tool(fn_name, args)
-                executed_tools.append({
-                    "id": tc_id,
-                    "name": fn_name,
-                    "arguments": json.dumps(args, ensure_ascii=False),
-                    "result": tool_res_str
-                })
-                t2_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": tool_res_str
-                })
-
-            t2_resp = await client.post(
-                f"{ollama_url}/v1/chat/completions",
-                json={"model": model_name, "messages": t2_messages, "stream": False}
-            )
-            t2_resp.raise_for_status()
-            final_reply = t2_resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            return {"reply": final_reply, "tool_calls": executed_tools}
+            waiting_retried = False
+            for attempt in range(6):
+                model_response = await client.post(
+                    f"{ollama_url}/v1/chat/completions",
+                    json={"model": model_name, "messages": messages, "tools": tb_tools, "stream": False}
+                )
+                model_response.raise_for_status()
+                msg = model_response.json().get("choices", [{}])[0].get("message", {})
+                tool_calls = msg.get("tool_calls") or []
+                if not tool_calls:
+                    content = (msg.get("content") or "").strip()
+                    if not content:
+                        raise ValueError("Model returned an empty response")
+                    if re.search(r'<\s*/?\s*(?:tools?|tool_call)\b|(?:sẽ|sẽ tiến hành)\s+(?:gọi|gửi|thực hiện)\b|(?:i will|i\'ll)\s+(?:call|send|execute)\b', content, re.IGNORECASE):
+                        rpc_sent = any(tool['name'] in ('send_rpc', 'thingsboard_rpc', 'execute_device_action') for tool in executed_tools)
+                        if waiting_retried or rpc_sent:
+                            content = ("Tôi chưa thể xác nhận yêu cầu điều khiển đã hoàn tất." if agent.get("language", "vi") == "vi"
+                                       else "I could not confirm that the control request completed.")
+                        else:
+                            waiting_retried = True
+                            messages.append({"role": "system", "content": "Do not describe a tool call in text. Call the appropriate tool using structured tool calls, or explain why you cannot."})
+                            continue
+                    if re.search(r"please wait|hold on|one moment|(?:i will|i'll) (?:get|fetch|retrieve|check)|(?:hãy|vui lòng) (?:đợi|chờ)|đợi một chút|(?:đang|sẽ) (?:lấy|tìm|truy xuất|kiểm tra)", content, re.IGNORECASE):
+                        if waiting_retried:
+                            content = ("Tôi chưa thể hoàn thành yêu cầu này." if agent.get("language", "vi") == "vi"
+                                       else "I could not complete this request.")
+                        else:
+                            waiting_retried = True
+                            messages.append({"role": "system", "content": "Do not ask the user to wait. Call the necessary tool now or explain clearly why you cannot complete the request."})
+                            continue
+                    return {"reply": content, "tool_calls": executed_tools}
+                messages.append(msg)
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    tc_id = tc.get("id", "call_default")
+                    fn_name = fn.get("name", "")
+                    raw_args = fn.get("arguments", "{}")
+                    try:
+                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                        if not isinstance(args, dict):
+                            args = {}
+                    except (ValueError, TypeError):
+                        args = {}
+                    try:
+                        tool_res_str = await execute_tool(fn_name, args)
+                    except Exception as exc:
+                        logger.warning("Tool %s failed: %s", fn_name, type(exc).__name__)
+                        tool_res_str = json.dumps({"status": "error", "message": "ThingsBoard request failed or timed out."})
+                    executed_tools.append({"id": tc_id, "name": fn_name,
+                        "arguments": json.dumps(args, ensure_ascii=False), "result": tool_res_str})
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_res_str})
+            raise ValueError("Model exceeded the tool-call limit")
 
     except Exception as e:
         logger.error("Error during agent chat inference: %s", e)
         raise HTTPException(status_code=500, detail=f"LLM inference failure: {str(e)}")
 
 
+@app.post("/api/agents/{agent_id}/v1/chat/completions")
+async def device_agent_chat(agent_id: str, request: Request, authorization: Optional[str] = Header(None)):
+    token = authorization.removeprefix("Bearer ").strip() if authorization else ""
+    if not SECRET_KEY or not secrets.compare_digest(token, SECRET_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    body = await request.json()
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="Messages are required")
+    history = [message for message in messages if isinstance(message, dict)
+               and message.get("role") in ("user", "assistant") and isinstance(message.get("content"), str)]
+    if not history or history[-1]["role"] != "user":
+        raise HTTPException(status_code=400, detail="The last message must be from the user")
+    agent = accounts.get_agent_by_id(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    result = await run_agent_chat(agent, AgentChatRequest(message=history[-1]["content"], history=history[:-1]))
+    response_id = "chatcmpl-" + uuid.uuid4().hex
+    model = body.get("model", "")
+    created = int(time.time())
+    if body.get("stream"):
+        async def stream():
+            for delta, reason in (({"role": "assistant", "content": result["reply"]}, None), ({}, "stop")):
+                payload = {"id": response_id, "object": "chat.completion.chunk", "created": created,
+                           "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": reason}]}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(stream(), media_type="text/event-stream")
+    return {"id": response_id, "object": "chat.completion", "created": created, "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": result["reply"]}, "finish_reason": "stop"}]}
+
+
 @app.get("/api/devices")
-async def list_devices_endpoint():
-    """Aggregates all registered hardware nodes across all agent profiles."""
-    return {"devices": platform_store.list_devices()}
+async def list_devices_endpoint(authorization: Optional[str] = Header(None)):
+    store = user_store(authorization)
+    devices = []
+    for device in device_db.list_authenticated_devices():
+        agent = store.get_agent(device['agent_id'])
+        if agent:
+            devices.append({**device, 'agent_name': agent['name'], 'agent_role': agent.get('role', 'Assistant'),
+                            'is_auth': True, 'ota_enabled': True})
+    return {'devices': devices}
 
 
 class CreateActivationRequest(BaseModel):
@@ -617,11 +682,9 @@ class CreateActivationRequest(BaseModel):
 
 
 @app.post("/api/devices/activation")
-async def create_activation_endpoint(req: CreateActivationRequest):
+async def create_activation_endpoint(req: CreateActivationRequest, authorization: Optional[str] = Header(None)):
     """Generates a temporary cryptographically random 6-digit numeric activation code."""
-    agent = platform_store.get_agent(req.agent_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail=f"Agent '{req.agent_id}' not found.")
+    agent = owned_agent(user_store(authorization), req.agent_id)
 
     ttl = min(max(req.expiration_seconds or 300, 60), 3600)
     record = device_db.create_activation_code(req.agent_id, ttl_seconds=ttl)
@@ -634,10 +697,17 @@ async def create_activation_endpoint(req: CreateActivationRequest):
     }
 
 
-@app.get("/api/devices/activation/status")
-async def get_activation_status_endpoint(code: str):
-    """Queries activation status of a 6-digit code for frontend progress detection."""
-    status_info = device_db.get_activation_status(code)
+class ActivationStatusRequest(BaseModel):
+    code: str
+
+
+@app.post("/api/devices/activation/status")
+async def get_activation_status_endpoint(body: ActivationStatusRequest, authorization: Optional[str] = Header(None)):
+    """Queries an activation code without putting it in the URL."""
+    store = user_store(authorization)
+    status_info = device_db.get_activation_status(body.code)
+    if not store.get_agent(status_info.get('agent_id')):
+        raise HTTPException(status_code=404, detail='Activation code not found')
     return status_info
 
 
@@ -649,35 +719,28 @@ class BindActivationCodeRequest(BaseModel):
 
 @app.post("/api/devices/activation/bind")
 @app.post("/api/devices/activate")
-async def bind_activation_code_endpoint(req: BindActivationCodeRequest):
-    """User enters the 6-digit code spoken/printed by the ESP32 and binds it to an Agent Profile."""
-    clean_code = req.code.strip()
-    agent = platform_store.get_agent(req.agent_id)
-    if not agent:
-        raise HTTPException(status_code=404, detail=f"Agent '{req.agent_id}' not found.")
-
+async def bind_activation_code_endpoint(req: BindActivationCodeRequest, request: Request, authorization: Optional[str] = Header(None)):
+    store = user_store(authorization)
+    owned_agent(store, req.agent_id)
+    address = request.client.host if request.client else 'unknown'
+    rate_id = f'bind:{address}'
+    if not accounts.record_attempt(rate_id):
+        raise HTTPException(status_code=429, detail='Too many attempts')
+    record = device_db.enrollment_record(req.code.strip())
+    if (not SECRET_KEY or not record or not record.get('enrollment_hash') or
+            record['status'] != 'pending' or record['expires_at'] <= time.time() or
+            (record['agent_id'] and record['agent_id'] != req.agent_id)):
+        raise HTTPException(status_code=400, detail='Invalid activation code')
+    token = hmac.new(SECRET_KEY.encode(), record['enrollment_hash'].encode(), hashlib.sha256).hexdigest()
+    existing = device_db.get_device_by_mac(record.get('mac_address') or '')
+    legacy_agent_id = existing['agent_id'] if existing and not accounts.get_agent_by_id(existing['agent_id']) else None
     try:
-        reg_result = device_db.bind_device_by_code(
-            code=clean_code,
-            agent_id=req.agent_id,
-            device_name=req.device_name
-        )
-        norm_mac = reg_result["mac_address"]
-        platform_store.bind_device(
-            mac_address=norm_mac,
-            agent_id=req.agent_id,
-            device_name=reg_result["device_name"]
-        )
-        return {
-            "status": "success",
-            "message": f"Bound device {norm_mac} to {agent['name']}",
-            "device": reg_result
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error("Error binding device by activation code: %s", e)
-        raise HTTPException(status_code=500, detail="Internal binding error.")
+        result = device_db.bind_device_by_code(req.code.strip(), req.agent_id, req.device_name,
+                                               raw_token=token, legacy_agent_id=legacy_agent_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    result.pop('device_token', None)
+    return {'status': 'success', 'device': result}
 
 
 # ==============================================================================
@@ -708,7 +771,9 @@ async def xiaozhi_ota_check_endpoint(request: Request):
         except Exception:
             pass
 
-    norm_mac = normalize_mac(device_mac) if device_mac else "30:ED:A0:29:54:4C"
+    norm_mac = normalize_mac(device_mac)
+    if not re.fullmatch(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}', norm_mac):
+        raise HTTPException(status_code=400, detail='Valid device MAC is required')
     logger.info("XiaoZhi ESP32 OTA Check from MAC: %s", norm_mac)
 
     server_time = {
@@ -717,7 +782,10 @@ async def xiaozhi_ota_check_endpoint(request: Request):
     }
 
     # Check if this hardware is already registered/bound
-    bound_agent = platform_store.get_agent_for_device(norm_mac)
+    authorization = request.headers.get('authorization', '')
+    token = authorization[7:].strip() if authorization.startswith('Bearer ') else ''
+    device = device_db.authenticate_device(token) if token else None
+    bound_agent = accounts.get_agent_by_id(device['agent_id']) if device and device['mac_address'] == norm_mac else None
 
     if bound_agent:
         logger.info("Device %s is already bound to %s (%s)", norm_mac, bound_agent["id"], bound_agent["name"])
@@ -728,13 +796,17 @@ async def xiaozhi_ota_check_endpoint(request: Request):
                 "url": ""
             },
             "websocket": {
-                "url": f"ws://{HOST_IP}:{WS_PUBLIC_PORT}/xiaozhi/v1/"
+                "url": PUBLIC_WS_URL
             }
         }
 
-    # Device is unregistered: generate 6-digit code for ESP32 to speak out
-    code = device_db.get_or_create_code_for_device(norm_mac, ttl_seconds=300)
-    logger.info("Delivering activation challenge code %s to device %s", code, norm_mac)
+    # Device is unregistered: require a device-held secret before issuing a code.
+    enrollment_key = request.headers.get('X-Enrollment-Key', '')
+    if not re.fullmatch(r'[0-9a-f]{64}', enrollment_key) or not SECRET_KEY:
+        raise HTTPException(status_code=400, detail='Enrollment credential required')
+    enrollment_hash = hashlib.sha256(enrollment_key.encode()).hexdigest()
+    code = device_db.get_or_create_code_for_device(norm_mac, ttl_seconds=300, enrollment_hash=enrollment_hash)
+    logger.info("Delivering activation challenge to device %s", norm_mac)
 
     return {
         "server_time": server_time,
@@ -749,7 +821,7 @@ async def xiaozhi_ota_check_endpoint(request: Request):
             "timeout_ms": 300000
         },
         "websocket": {
-            "url": f"ws://{HOST_IP}:{WS_PUBLIC_PORT}/xiaozhi/v1/"
+            "url": PUBLIC_WS_URL
         }
     }
 
@@ -776,17 +848,17 @@ async def xiaozhi_ota_activate_poll_endpoint(request: Request):
 
     norm_mac = normalize_mac(device_mac) if device_mac else ""
 
-    # Check if device is now activated
-    is_active = False
-    if norm_mac:
-        is_active = device_db.is_device_activated(norm_mac) or bool(platform_store.get_agent_for_device(norm_mac))
-
-    if is_active:
-        logger.info("ESP32 %s activation confirmed! Delivering 200 OK.", norm_mac)
-        return Response(content='{"code":0,"msg":"success"}', media_type="application/json", status_code=200)
-
-    # Still waiting for user to enter code on web console
-    return Response(content='{"code":202,"msg":"waiting for user input"}', media_type="application/json", status_code=202)
+    enrollment_key = request.headers.get('X-Enrollment-Key', '')
+    if not SECRET_KEY or not re.fullmatch(r'[0-9a-f]{64}', enrollment_key):
+        return Response(content='{"code":202,"msg":"waiting for user input"}', media_type='application/json', status_code=202)
+    enrollment_hash = hashlib.sha256(enrollment_key.encode()).hexdigest()
+    device = device_db.redeemed_enrollment(norm_mac, enrollment_hash)
+    if device and accounts.get_agent_by_id(device['agent_id']):
+        token = hmac.new(SECRET_KEY.encode(), enrollment_hash.encode(), hashlib.sha256).hexdigest()
+        if secrets.compare_digest(device['token_hash'], hashlib.sha256(token.encode()).hexdigest()):
+            return {'code': 0, 'device_id': device['device_id'], 'agent_id': device['agent_id'], 'device_token': token,
+                    'ws_url': PUBLIC_WS_URL}
+    return Response(content='{"code":202,"msg":"waiting for user input"}', media_type='application/json', status_code=202)
 
 
 class RegisterDeviceRequest(BaseModel):
@@ -802,31 +874,26 @@ async def register_device_endpoint(req: RegisterDeviceRequest, request: Request)
     """Redeems an activation code, registers device, and issues hashed token credentials."""
     client_ip = request.client.host if request.client else "unknown"
     norm_mac = normalize_mac(req.mac_address)
-    rate_id = f"{client_ip}:{norm_mac}"
+    rate_id = f"register:{client_ip}"
+    if not re.fullmatch(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}', norm_mac):
+        raise HTTPException(status_code=400, detail='Valid device MAC is required')
 
-    # Check brute-force rate limit
-    allowed, remaining = device_db.check_rate_limit(rate_id)
-    if not allowed:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Too many failed registration attempts. Locked for {remaining} seconds."
-        )
+    if not accounts.record_attempt(rate_id):
+        raise HTTPException(status_code=429, detail='Too many attempts')
 
     try:
+        activation = device_db.get_activation_status(req.activation_code.strip())
+        if not accounts.get_agent_by_id(activation.get('agent_id')):
+            raise ValueError('Invalid activation code.')
+        existing = device_db.get_device_by_mac(norm_mac)
+        legacy_agent_id = existing['agent_id'] if existing and not accounts.get_agent_by_id(existing['agent_id']) else None
         reg_result = device_db.register_device_with_code(
             code=req.activation_code.strip(),
             mac_address=norm_mac,
             device_name=req.device_name,
             hardware_model=req.hardware_model or "ESP32-S3",
-            firmware_version=req.firmware_version or "v2.1.8"
-        )
-        device_db.reset_failed_attempts(rate_id)
-
-        # Sync with agent profile device list in platform_store
-        platform_store.bind_device(
-            mac_address=norm_mac,
-            agent_id=reg_result["agent_id"],
-            device_name=reg_result["device_name"]
+            firmware_version=req.firmware_version or "v2.1.8",
+            legacy_agent_id=legacy_agent_id
         )
 
         return {
@@ -837,13 +904,12 @@ async def register_device_endpoint(req: RegisterDeviceRequest, request: Request)
             "agent_id": reg_result["agent_id"],
             "device_name": reg_result["device_name"],
             "config": {
-                "ws_url": f"ws://{HOST_IP}:{WS_PUBLIC_PORT}/xiaozhi/v1/",
-                "ota_url": f"http://{HOST_IP}:8003/xiaozhi/ota/",
+                "ws_url": PUBLIC_WS_URL,
+                "ota_url": PUBLIC_OTA_URL,
                 "heartbeat_interval_seconds": 30
             }
         }
     except ValueError as e:
-        device_db.record_failed_attempt(rate_id, max_attempts=5, lockout_seconds=300)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Device registration error: %s", e)
@@ -863,13 +929,92 @@ def extract_device_token(
     raise HTTPException(status_code=401, detail="Missing device authentication credential.")
 
 
+def authenticated_device(token: str):
+    device = device_db.authenticate_device(token)
+    if not device or not accounts.get_agent_by_id(device['agent_id']):
+        raise HTTPException(status_code=401, detail='Invalid or revoked device token.')
+    return device
+
+
+@app.websocket('/xiaozhi/v1/')
+async def device_websocket(socket: WebSocket):
+    authorization = socket.headers.get('authorization', '')
+    token = authorization[7:].strip() if authorization.startswith('Bearer ') else ''
+    device = device_db.authenticate_device(token) if token else None
+    if (not device or not accounts.get_agent_by_id(device['agent_id']) or
+            normalize_mac(socket.headers.get('device-id', '')) != device['mac_address']):
+        await socket.close(code=4401)
+        return
+
+    import websockets
+    from websockets.exceptions import WebSocketException
+    upstream_url = os.getenv('XIAOZHI_UPSTREAM_WS', 'ws://xiaozhi-server:8002/xiaozhi/v1/')
+    headers = {key: value for key, value in socket.headers.items()
+               if key in ('device-id', 'client-id', 'protocol-version')}
+    try:
+        async with websockets.connect(upstream_url, additional_headers=headers) as upstream:
+            await socket.accept()
+
+            last_check = 0.0
+            allowed = False
+            check_lock = asyncio.Lock()
+
+            def check_device():
+                active = device_db.authenticate_device(token)
+                return bool(active and active['agent_id'] == device['agent_id'] and
+                            accounts.get_agent_by_id(active['agent_id']))
+
+            async def still_authorized():
+                nonlocal last_check, allowed
+                async with check_lock:
+                    # shortcut: revocation may take one second, shorten if immediate disconnect is required.
+                    if time.monotonic() - last_check >= 1.0:
+                        allowed = await run_in_threadpool(check_device)
+                        last_check = time.monotonic()
+                    return allowed
+
+            async def to_upstream():
+                while True:
+                    message = await socket.receive()
+                    if message['type'] == 'websocket.disconnect' or not await still_authorized():
+                        return
+                    data = message.get('bytes') if message.get('bytes') is not None else message.get('text')
+                    if data is not None:
+                        await upstream.send(data)
+
+            async def to_device():
+                async for data in upstream:
+                    if not await still_authorized():
+                        return
+                    if isinstance(data, bytes):
+                        await socket.send_bytes(data)
+                    else:
+                        await socket.send_text(data)
+
+            tasks = [asyncio.create_task(to_upstream()), asyncio.create_task(to_device())]
+            try:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+    except (WebSocketDisconnect, OSError, WebSocketException):
+        pass
+    finally:
+        try:
+            await socket.close()
+        except (RuntimeError, WebSocketDisconnect):
+            pass
+
+
 @app.get("/api/devices/me")
 async def get_device_me_endpoint(request: Request, authorization: Optional[str] = Header(None), x_device_token: Optional[str] = Header(None, alias="X-Device-Token")):
     """Returns authenticated identity and metadata for the calling physical device."""
     raw_token = extract_device_token(request, authorization, x_device_token)
-    device = device_db.authenticate_device(raw_token)
-    if not device:
-        raise HTTPException(status_code=401, detail="Invalid or revoked device token.")
+    device = authenticated_device(raw_token)
 
     return {
         "device_id": device["device_id"],
@@ -889,17 +1034,15 @@ async def get_device_me_endpoint(request: Request, authorization: Optional[str] 
 async def get_device_me_config_endpoint(request: Request, authorization: Optional[str] = Header(None), x_device_token: Optional[str] = Header(None, alias="X-Device-Token")):
     """Returns assigned runtime configuration without exposing sensitive ThingsBoard keys."""
     raw_token = extract_device_token(request, authorization, x_device_token)
-    device = device_db.authenticate_device(raw_token)
-    if not device:
-        raise HTTPException(status_code=401, detail="Invalid or revoked device token.")
+    device = authenticated_device(raw_token)
 
-    agent = platform_store.get_agent(device["agent_id"]) or {}
+    agent = accounts.get_agent_by_id(device["agent_id"]) or {}
 
     return {
         "device_id": device["device_id"],
         "mac_address": device["mac_address"],
-        "ws_url": f"ws://{HOST_IP}:{WS_PUBLIC_PORT}/xiaozhi/v1/",
-        "ota_url": f"http://{HOST_IP}:8003/xiaozhi/ota/",
+        "ws_url": PUBLIC_WS_URL,
+        "ota_url": PUBLIC_OTA_URL,
         "heartbeat_interval_seconds": 30,
         "agent": {
             "id": agent.get("id", device["agent_id"]),
@@ -934,6 +1077,7 @@ async def device_heartbeat_endpoint(
     if not raw_token:
         raise HTTPException(status_code=401, detail="Missing authentication token for heartbeat.")
 
+    authenticated_device(raw_token)
     updated = device_db.update_heartbeat(raw_token)
     if not updated:
         raise HTTPException(status_code=401, detail="Invalid or revoked device token.")
@@ -945,12 +1089,9 @@ async def device_heartbeat_endpoint(
 async def device_me_unbind_endpoint(request: Request, authorization: Optional[str] = Header(None), x_device_token: Optional[str] = Header(None, alias="X-Device-Token")):
     """Allows device to initiate self-unbinding and revoke credentials."""
     raw_token = extract_device_token(request, authorization, x_device_token)
-    device = device_db.authenticate_device(raw_token)
-    if not device:
-        raise HTTPException(status_code=401, detail="Invalid or revoked device token.")
+    device = authenticated_device(raw_token)
 
     device_db.unbind_device_by_token(raw_token)
-    platform_store.unbind_device(device["mac_address"])
     return {"status": "success", "message": f"Device {device['device_id']} unbound successfully"}
 
 
@@ -974,12 +1115,13 @@ class UnbindDeviceRequest(BaseModel):
 
 
 @app.post("/api/devices/unbind")
-async def unbind_device_endpoint(req: UnbindDeviceRequest):
-    try:
-        platform_store.unbind_device(req.mac_address)
-        return {"status": "success", "message": f"Unbound device {req.mac_address}"}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+async def unbind_device_endpoint(req: UnbindDeviceRequest, authorization: Optional[str] = Header(None)):
+    store = user_store(authorization)
+    device = device_db.get_device_by_mac(normalize_mac(req.mac_address))
+    if not device or not store.get_agent(device['agent_id']):
+        raise HTTPException(status_code=404, detail='Device not found')
+    device_db.unbind_device_by_identifier(device['mac_address'])
+    return {'status': 'success', 'message': 'Device unbound'}
 
 
 class ThingsBoardTestRequest(BaseModel):
@@ -989,25 +1131,20 @@ class ThingsBoardTestRequest(BaseModel):
 
 
 @app.post("/api/integrations/thingsboard/test")
-async def test_thingsboard_integration(req: ThingsBoardTestRequest):
+async def test_thingsboard_integration(req: ThingsBoardTestRequest, authorization: Optional[str] = Header(None)):
     """Tests connectivity to ThingsBoard instance and reports discovered devices."""
-    host = req.host
+    store = user_store(authorization)
+    if not req.agent_id:
+        raise HTTPException(status_code=400, detail='Agent is required')
+    agent = owned_agent(store, req.agent_id)
+    tb = agent.get('integrations', {}).get('thingsboard', {})
+    host = (req.host or tb.get('host') or '').rstrip('/')
     api_key = req.api_key
-
-    if req.agent_id:
-        agent = platform_store.get_agent(req.agent_id)
-        if agent:
-            tb = agent.get("integrations", {}).get("thingsboard", {})
-            if not host:
-                host = tb.get("host")
-            if not api_key or "..." in api_key or api_key == "***":
-                api_key = tb.get("api_key")
-
-    host = (host or os.getenv("THINGSBOARD_HOST", "https://codehelpers.tech")).rstrip("/")
-    api_key = api_key or os.getenv(
-        "THINGSBOARD_API_KEY",
-        "tb_G5TSH2WJsF3g25Q_7jImZwyUpdAYqGtI6cT86c-dMCKy_d8WZ3M3rNjn9zhzOT5Y9AnvV-KKQPpIQChD7qPluA"
-    )
+    if not api_key or '...' in api_key or api_key == '***':
+        api_key = tb.get('api_key', '')
+    if not host:
+        return {'status': 'error', 'message': 'No ThingsBoard host configured.'}
+    host = validate_thingsboard_origin(host)
 
     if not api_key:
         return {"status": "error", "message": "No API key provided or configured."}
@@ -1041,15 +1178,18 @@ async def test_thingsboard_integration(req: ThingsBoardTestRequest):
 
 
 @app.get("/api/integrations/thingsboard/telemetry")
-async def get_thingsboard_telemetry(agent_id: Optional[str] = "agent_101"):
+async def get_thingsboard_telemetry(agent_id: Optional[str] = None, authorization: Optional[str] = Header(None)):
     """Safe read-only telemetry preview exposing authorized ThingsBoard data."""
-    agent = platform_store.get_agent(agent_id or "agent_101")
-    tb = agent.get("integrations", {}).get("thingsboard", {}) if agent else {}
-    host = (tb.get("host") or os.getenv("THINGSBOARD_HOST", "https://codehelpers.tech")).rstrip("/")
-    api_key = tb.get("api_key") or os.getenv(
-        "THINGSBOARD_API_KEY",
-        "tb_G5TSH2WJsF3g25Q_7jImZwyUpdAYqGtI6cT86c-dMCKy_d8WZ3M3rNjn9zhzOT5Y9AnvV-KKQPpIQChD7qPluA"
-    )
+    store = user_store(authorization)
+    if not agent_id:
+        raise HTTPException(status_code=400, detail='Agent is required')
+    agent = owned_agent(store, agent_id)
+    tb = agent.get('integrations', {}).get('thingsboard', {})
+    host = (tb.get('host') or '').rstrip('/')
+    api_key = tb.get('api_key') or ''
+    if not host or not api_key:
+        return {'status': 'error', 'message': 'ThingsBoard is not configured.'}
+    host = validate_thingsboard_origin(host)
 
     import httpx
     headers = {
