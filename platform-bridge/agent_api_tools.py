@@ -82,6 +82,10 @@ async def _all_devices(client, host, headers):
         page += 1
 
 
+def _normalize_device_name(value):
+    return re.sub(r'[\s_-]+', ' ', value or '').strip().casefold()
+
+
 def _matching_device(devices, name):
     if not name:
         return None
@@ -91,7 +95,18 @@ def _matching_device(devices, name):
         (d.get("label") or "").casefold(),
         (d.get("id", {}).get("id") or "").casefold(),
     )]
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        return None
+    norm_target = _normalize_device_name(name)
+    if not norm_target:
+        return None
+    norm_matches = [d for d in devices if norm_target in (
+        _normalize_device_name(d.get("name")),
+        _normalize_device_name(d.get("label")),
+    )]
+    return norm_matches[0] if len(norm_matches) == 1 else None
 
 
 async def authorize_rpc(config, profile_id, device_id, method, params):

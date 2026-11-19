@@ -12,6 +12,18 @@ api_tools = importlib.import_module('platform-bridge.agent_api_tools')
 
 
 class AgentApiToolsTests(unittest.IsolatedAsyncioTestCase):
+    def test_matching_device_normalizes_separators_when_unique(self):
+        devices = [
+            {'name': 'Simulated Tasmota A', 'label': None, 'id': {'id': 'id-a'}},
+            {'name': 'Simulated Tasmota B', 'label': None, 'id': {'id': 'id-b'}},
+            {'name': 'relay-1', 'label': '', 'id': {'id': 'id-r1'}},
+            {'name': 'relay 1', 'label': '', 'id': {'id': 'id-r2'}},
+        ]
+        self.assertEqual(api_tools._matching_device(devices, 'simulated-tasmota-B')['id']['id'], 'id-b')
+        self.assertEqual(api_tools._matching_device(devices, 'Simulated_Tasmota_A')['id']['id'], 'id-a')
+        self.assertIsNone(api_tools._matching_device(devices, 'relay_1'))
+        self.assertIsNone(api_tools._matching_device(devices, 'simulated-tasmota'))
+
     async def test_rpc_is_not_sent_without_capability_authorization(self):
         client = AsyncMock()
         with patch.object(api_tools, 'authorize_rpc', AsyncMock(return_value='RPC method is not registered')):

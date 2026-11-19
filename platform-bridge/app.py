@@ -648,7 +648,7 @@ async def run_agent_chat(agent: Dict[str, Any], req: AgentChatRequest):
                             messages.append({"role": "assistant", "content": "I have not executed the device action yet."})
                             messages.append({"role": "user", "content": f"No RPC tool was called yet for {user_text!r}. Call execute_device_action now using a registered method (setPower with state=true for on/bật, state=false for off/tắt; call list_available_rpc first only if you do not know the method)."})
                             continue
-                    if re.search(r"please wait|hold on|one moment|(?:i will|i'll) (?:get|fetch|retrieve|check)|(?:hãy|vui lòng) (?:đợi|chờ)|đợi một chút|(?:đang|sẽ) (?:lấy|tìm|truy xuất|kiểm tra)", content, re.IGNORECASE):
+                    if not rpc_sent and re.search(r"please wait|hold on|one moment|(?:i will|i'll) (?:get|fetch|retrieve|check)|(?:hãy|vui lòng) (?:đợi|chờ)|đợi một chút|(?:đang|sẽ) (?:lấy|tìm|truy xuất|kiểm tra)", content, re.IGNORECASE):
                         if waiting_retried:
                             content = ("Tôi chưa thể hoàn thành yêu cầu này." if agent.get("language", "vi") == "vi"
                                        else "I could not complete this request.")

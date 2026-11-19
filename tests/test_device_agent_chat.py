@@ -182,3 +182,28 @@ class DeviceAgentChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['reply'], 'Đã bật nguồn Simulated Tasmota B.')
         self.assertEqual(len(result['tool_calls']), 1)
         self.assertEqual(len(responses), 0)
+
+    async def test_does_not_repeat_rpc_when_reply_mentions_waiting_after_rpc_sent(self):
+        agent = {'id': 'agent-a', 'language': 'en', 'integrations': {'thingsboard': {'host': 'http://tb.test', 'api_key': 'private'}}}
+        device_id = '11111111-2222-3333-4444-555555555555'
+        responses = [
+            {'choices': [{'message': {'role': 'assistant', 'tool_calls': [{'id': 'rpc1', 'function': {'name': 'execute_device_action', 'arguments': '{"device_identifier":"' + device_id + '","method":"setPower","params":{"state":false}}'}}]}}]},
+            {'choices': [{'message': {'content': 'Command submitted. Please wait a moment for the device to confirm.'}}]},
+        ]
+        def response(data, status=200):
+            result = MagicMock(status_code=status)
+            result.json.return_value = data
+            return result
+        async def post(url, **kwargs):
+            return response('', 200) if url.startswith('http://tb.test') else response(responses.pop(0))
+        fake = AsyncMock()
+        fake.post.side_effect = post
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(return_value=fake)
+        context.__aexit__ = AsyncMock(return_value=False)
+        with patch('httpx.AsyncClient', return_value=context), \
+                patch.object(bridge.agent_api_tools, 'authorize_rpc', new=AsyncMock(return_value=None)):
+            result = await bridge.run_agent_chat(agent, bridge.AgentChatRequest(message='tắt nguồn simulated tasmota A'))
+        self.assertEqual(result['reply'], 'Command submitted. Please wait a moment for the device to confirm.')
+        self.assertEqual(len(result['tool_calls']), 1)
+        self.assertEqual(len(responses), 0)
