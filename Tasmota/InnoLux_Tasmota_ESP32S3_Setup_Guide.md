@@ -1,11 +1,11 @@
-# Yolo-Uno (ESP32-S3) Tasmota Gateway: BLE Light Sensor + DHT20 → CoreIoT
+# Yolo-Uno (ESP32-S3) Tasmota Gateway: BLE Light Sensor + DHT20 → ThingsBoard
 
 This guide sets up a Yolo-Uno board running Tasmota as a gateway that:
 
 - connects to the **InnoLab BLE light sensor** (`inno-013-7985`) over Bluetooth Low Energy and reads illuminance, and
 - reads the **DHT20** temperature/humidity sensor over I2C,
 
-then publishes both to **CoreIoT** over MQTT.
+then publishes both to **ThingsBoard** (`https://codehelpers.tech`) through the public MQTT broker `broker.emqx.io`.
 
 | Item | Value |
 | :--- | :--- |
@@ -13,8 +13,9 @@ then publishes both to **CoreIoT** over MQTT.
 | Light sensor | InnoLab BLE, name `inno-013-7985`, Nordic UART Service (notifications) |
 | Temp/humidity sensor | DHT20 (AHT20 inside), I2C address `0x38`, on GPIO11 (SDA) / GPIO12 (SCL) |
 | Firmware | Tasmota **v16.0.0**, custom build `tasmota32s3-mi32` |
-| Cloud | CoreIoT (ThingsBoard MQTT), `app.coreiot.io:1883`, topic `v1/devices/me/telemetry` |
-| Telemetry | `{"lux":…}`, `{"temperature":…,"humidity":…}` |
+| Cloud | ThingsBoard at `https://codehelpers.tech`, fed from `broker.emqx.io:1883` (prefix `tbch_8x4k`) |
+| MQTT topic | `tbch_8x4k/tele/<Topic>/SENSOR` (e.g. `tbch_8x4k/tele/sensor1/SENSOR`) |
+| Telemetry keys | `illuminance`, `temperature`, `humidity` (also `InnoLux_Illuminance`, `DHT20_Temperature`, `DHT20_Humidity`) |
 | Host PC | Windows, PowerShell, PlatformIO Core 6.2.0 (Python 3.11) |
 
 ---
@@ -45,6 +46,8 @@ then publishes both to **CoreIoT** over MQTT.
 | BLE GATT client (Berry `BLE` module) | **Firmware** (custom build) | The light sensor sends readings only after a GATT connection and a notification subscription. Only the *legacy MI32* driver (`USE_MI_ESP32` **without** `USE_BLE_ESP32`) gives Berry this ability. No official ESP32-S3 binary includes it. |
 | DHT20 reading | **Script** (`autoexec.be`) | Every Tasmota build has I2C access from Berry (`tasmota.wire1`). The script talks to the AHT20 chip directly, so no firmware option is needed. |
 | Turning on BLE (`SetOption115`) and setting the I2C pins | **Script** | On boot, the script checks both. If either is missing, it sets both and restarts once. |
+| Publishing | **Tasmota itself** | The script adds its readings to Tasmota's standard `SENSOR` message (Berry driver `json_append`). Tasmota publishes it every `TelePeriod` to the Full Topic, and the ThingsBoard converter picks it up. |
+| `TelePeriod` | **Script** | Set to 10 s automatically (no restart). |
 | Wi-Fi and MQTT | Entered once in the web page (or built in, see [Appendix C](#appendix-c-user_config_overrideh-optional)) | Stored in the board's settings. |
 
 So you build the firmware **once**. Everything else is handled by `autoexec.be`.
@@ -76,7 +79,7 @@ So you build the firmware **once**. Everything else is handled by `autoexec.be`.
 - **PlatformIO Core 6.2.0**, through the VS Code PlatformIO extension or `pip install platformio==6.2.0` (Python 3.11–3.13).
 - A **USB data cable** for the Yolo-Uno.
 - The 2.4 GHz **Wi-Fi name and password**.
-- A **CoreIoT device** and its **access token** (CoreIoT → *Devices* → your device → *Copy access token*).
+- An account on `https://codehelpers.tech` to view the data. Devices are created automatically from the MQTT topic, so no token is needed.
 - A **DHT20** module and four jumper wires.
 
 If `pio` isn't recognised in PowerShell, add it to `PATH` for the current window:
@@ -201,27 +204,29 @@ Backlog SSID1 YourWifiName; Password1 YourPassword
 
 The IP address appears in the log after the restart.
 
-### 6.2 MQTT for CoreIoT
+### 6.2 MQTT for ThingsBoard (`broker.emqx.io`)
 
 Web page → **Configuration** → **Configure MQTT**:
 
 | Field | Value |
 | :--- | :--- |
-| Host | `app.coreiot.io` (or your CoreIoT server) |
+| Host | `broker.emqx.io` |
 | Port | `1883` |
 | Client | leave default |
-| User | `<YOUR_COREIOT_DEVICE_ACCESS_TOKEN>` |
+| User | *(empty)* |
 | Password | *(empty)* |
-| Topic | `devices/me` |
-| Full Topic | leave default |
+| Topic | `sensor1` (this becomes the device name on ThingsBoard; use `sensor2`, … for more boards) |
+| Full Topic | `tbch_8x4k/%prefix%/%topic%/` |
 
 Click **Save**, or enter the same settings in **Consoles → Console** (a lone `"` sets an empty value):
 
 ```
-Backlog MqttHost app.coreiot.io; MqttPort 1883; MqttUser <TOKEN>; MqttPassword "; Topic devices/me
+Backlog MqttHost broker.emqx.io; MqttPort 1883; MqttUser "; MqttPassword "; Topic sensor1; FullTopic tbch_8x4k/%prefix%/%topic%/
 ```
 
-The console should show `MQT: Connected`.
+The console should show `MQT: Connected`. If the board previously had `Rule1`/`Rule2` pushing to `v1/devices/me/telemetry`, turn them off with `Rule1 0` and `Rule2 0`.
+
+> `broker.emqx.io` is a **public** test broker with no password. Anyone who knows the topic can read the data, so don't send anything sensitive through it. The `tbch_8x4k` prefix only keeps your messages apart from other users' and matches the ThingsBoard setup.
 
 Bluetooth and the I2C pins don't need setting by hand. The script handles them in the next step.
 
@@ -250,13 +255,23 @@ and restarts once. From then on it runs without further intervention.
 **Light sensor**
 - Turns on active scanning (`MI32Option4 1`) and looks for `inno-013-7985`.
 - Connects and subscribes to `6e400003-…`.
-- On each notification (`op 103`), checks the frame (header, XOR checksum, footer), reads the float, and publishes `{"lux":<value>}`.
+- On each notification (`op 103`), checks the frame (header, XOR checksum, footer) and stores the latest lux value.
 - On error, disconnect, or 60 s without data, it disconnects and scans again.
 
 **DHT20**
-- Every 10 s (`DHT_PERIOD_S`), measures over I2C, checks the CRC, and publishes `{"temperature":<°C>,"humidity":<%RH>}`.
-- Runs independently of BLE, so temperature and humidity keep coming in while the light sensor is offline.
-- If the firmware also has Tasmota's AHT2x driver ([Appendix C](#appendix-c-user_config_overrideh-optional)), it uses that driver's readings instead.
+- Every 10 s (`DHT_PERIOD_S`), measures over I2C, checks the CRC, and stores temperature and humidity.
+- Runs independently of BLE.
+- If the firmware also has Tasmota's AHT2x driver ([Appendix C](#appendix-c-user_config_overrideh-optional)), the script leaves the DHT20 to that driver.
+
+**Publishing**
+- The script sets `TelePeriod` to 10 s (`TELE_PERIOD_S`).
+- Every `TelePeriod`, Tasmota publishes to `tbch_8x4k/tele/sensor1/SENSOR`:
+
+  ```json
+  {"Time":"2026-11-19T09:30:00","InnoLux":{"Illuminance":145.2},"DHT20":{"Temperature":28.4,"Humidity":71.3}}
+  ```
+- Values older than 2 min (lux) or 1 min (DHT20) are left out instead of repeating old data.
+- The same values appear on Tasmota's main web page.
 
 ---
 
@@ -272,9 +287,12 @@ InnoLuxBLE: driver started
 InnoLuxBLE: scanning for inno-013-7985
 InnoLuxBLE: found inno-013-7985 (xxxxxxxxxxxx), connecting...
 InnoLuxBLE: subscribed to notifications
-InnoLuxBLE -> {"lux":145.20}
-DHT20 -> {"temperature":28.4,"humidity":71.3}
+MQT: tbch_8x4k/tele/sensor1/SENSOR = {"Time":"…","InnoLux":{"Illuminance":145.2},"DHT20":{"Temperature":28.4,"Humidity":71.3}}
 ```
+
+Individual readings are logged at debug level (`InnoLuxBLE: 145.20 lx`, `DHT20: 28.4 C, 71.3 %RH`). Run `WebLog 3` to see them.
+
+The main web page also shows **InnoLux Illuminance**, **DHT20 Temperature** and **DHT20 Humidity**.
 
 ### Checks
 
@@ -285,11 +303,17 @@ DHT20 -> {"temperature":28.4,"humidity":71.3}
 | Berry BLE module | Berry console: `import BLE print(BLE)` (only after the line above) | `<module: BLE>` |
 | DHT20 on the bus | `I2CScan` | device at `0x38` |
 | MQTT | console log | `MQT: Connected` |
+| Topic settings | `FullTopic` / `Topic` | `tbch_8x4k/%prefix%/%topic%/` / `sensor1` |
+| Publish interval | `TelePeriod` | `10` |
+| Watch the broker (optional) | any MQTT client (e.g. MQTTX) on `broker.emqx.io:1883`, subscribe to `tbch_8x4k/#` | `SENSOR` messages every 10 s |
 | Firmware | *Information → Program version* | `bluetooth` image |
 
-### CoreIoT
+### ThingsBoard
 
-CoreIoT → **Devices** → your device → **Latest telemetry**: `lux`, `temperature` and `humidity` should be updating.
+Open `https://codehelpers.tech` → **Entities → Devices** → `sensor1` (created automatically on the first message).
+
+- **Latest telemetry:** `illuminance`, `temperature`, `humidity`, plus `InnoLux_Illuminance`, `DHT20_Temperature`, `DHT20_Humidity`, and Tasmota's own keys (`online`, `rssi`, …).
+- **Attributes → Client attributes:** `tasmotaTopic`, `online`, `lwt`.
 
 ---
 
@@ -328,9 +352,12 @@ CoreIoT → **Devices** → your device → **Latest telemetry**: `lux`, `temper
 | Stuck on `scanning` | Sensor off or out of range, or a different name. | Check with nRF Connect. Edit `target_name` in the script. |
 | `error N (op M)` while connecting | GATT error. | Check the service/characteristic UUIDs in nRF Connect. Note the numbers for debugging. |
 | `subscribed` but no `->` lines | The sensor may need a start command on RX `6e400002-…`. | Check the sensor's docs or app. |
+| No `SENSOR` messages / device missing in ThingsBoard | Wrong Full Topic or Topic, or nothing to report yet. | Check `FullTopic` is exactly `tbch_8x4k/%prefix%/%topic%/` (trailing slash included). Wait for a lux or DHT20 reading. Subscribe to `tbch_8x4k/#` with MQTTX to see what is sent. |
+| Values missing from `SENSOR` | Readings older than the age limit are left out. | Check the light sensor is connected (console) and the DHT20 is found. |
+| Old `v1/devices/me/telemetry` data still arriving | Leftover `Rule1`/`Rule2` from earlier setups. | `Rule1 0`, `Rule2 0`. |
 | `DHT20: not found at 0x38` | Wiring, or wrong pins. | `I2CScan` must show `0x38`. Check 3V3/GND, SDA/SCL not swapped, and `SDA_GPIO`/`SCL_GPIO` match your board. |
 | `I2CScan` finds nothing | I2C pins not set or wrong. | `Backlog GPIO11 640; GPIO12 608; Restart 1` (adjust GPIOs). |
-| MQTT keeps reconnecting | Wrong token, or CoreIoT rejects Tasmota's own `tele/…`/`stat/…` messages. | Check the token. Look at the `MQT:` log lines. |
+| MQTT keeps reconnecting | Wrong host/port, network blocks port 1883, or two boards share the same MQTT client ID. | Check `MqttHost broker.emqx.io` and `MqttPort 1883`. Try another network. Leave `MqttClient` at its default (unique per board). |
 
 ---
 
@@ -366,27 +393,48 @@ lib_ignore                  = Micro-RTSP
 Upload to the board's file system as `/autoexec.be`. **Required.**
 
 ```berry
-# Yolo-Uno (ESP32-S3) Tasmota gateway -> CoreIoT (v1/devices/me/telemetry)
-#   - InnoLab BLE light sensor (inno-013-7985) via legacy MI32 Berry BLE  -> {"lux":..}
-#   - DHT20 (AHT20, I2C 0x38) via Berry I2C (or Tasmota AHT2x if built in) -> {"temperature":..,"humidity":..}
-# Firmware: env tasmota32s3-mi32 (needed for BLE). DHT20 is read directly over Berry I2C,
-# so no extra firmware option is needed. SetOption115 and the I2C pins are set automatically.
+# Yolo-Uno (ESP32-S3) Tasmota gateway -> ThingsBoard (codehelpers.tech) via broker.emqx.io
+#
+#   - InnoLab BLE light sensor (inno-013-7985) via legacy MI32 Berry BLE
+#   - DHT20 (AHT20, I2C 0x38) via Berry I2C (or Tasmota AHT2x driver if built in)
+#
+# Readings are added to Tasmota's standard SENSOR message, so Tasmota itself publishes them to
+#   <FullTopic>  tbch_8x4k/tele/<Topic>/SENSOR   (e.g. tbch_8x4k/tele/sensor1/SENSOR)
+# every TelePeriod, e.g.
+#   {"Time":"...","InnoLux":{"Illuminance":145.2},"DHT20":{"Temperature":28.4,"Humidity":71.3}}
+# The ThingsBoard converter maps these to illuminance / temperature / humidity
+# (plus InnoLux_Illuminance, DHT20_Temperature, DHT20_Humidity).
+#
+# MQTT settings (Configuration -> Configure MQTT): Host broker.emqx.io, Port 1883,
+# User/Password empty, Topic sensor1, Full Topic tbch_8x4k/%prefix%/%topic%/
+#
+# Firmware: env tasmota32s3-mi32 (needed for BLE). SetOption115, I2C pins and TelePeriod are
+# set automatically.
 
-import mqtt
 import math
 import string
 import cb
 import global
 import json
 
+# ---------------- settings ----------------
+var TELE_PERIOD_S = 10         # how often Tasmota publishes SENSOR (min 10)
+var DHT_PERIOD_S  = 10         # how often the DHT20 is read
+var SDA_GPIO = 11              # Yolo-Uno I2C pins (check your board's labels)
+var SCL_GPIO = 12
+
 # Globals declared up front (Berry strict mode); callback pointers created ONCE
 innolux = nil
 dht = nil
 dht_ok = false
+sensors = {"lux": nil, "lux_ms": 0, "t": nil, "h": nil, "th_ms": 0}
 inno_adv_ptr  = cb.gen_cb(/svc, manu -> (global.innolux != nil ? global.innolux.on_adv(svc, manu) : nil))
 inno_conn_ptr = cb.gen_cb(/err, op, uuid, handle -> (global.innolux != nil ? global.innolux.on_conn(err, op, uuid, handle) : nil))
 
-class InnoLuxCoreIoT
+# =====================================================================
+#  InnoLab BLE light sensor
+# =====================================================================
+class InnoLuxBLE
   var ble                        # BLE module, imported once the stack is up
   var target_name, svc_uuid, tx_uuid
   var adv_buf, conn_buf
@@ -394,7 +442,6 @@ class InnoLuxCoreIoT
   var busy                       # true while connecting / connected
   var last_rx                    # millis of last valid frame
 
-  static TELEMETRY_TOPIC = "v1/devices/me/telemetry"
   static WATCHDOG_MS = 60000     # no data for 60 s -> drop link and rescan
 
   def init(ble)
@@ -407,10 +454,8 @@ class InnoLuxCoreIoT
     self.busy = false
     self.last_rx = 0
 
-    # Active scanning so the device name in the scan response is received
-    tasmota.cmd("MI32Option4 1")
+    tasmota.cmd("MI32Option4 1") # active scanning: names arrive in scan responses
 
-    # Callback pointers are created once at file level (gen_cb has limited slots)
     self.adv_ptr  = inno_adv_ptr
     self.conn_ptr = inno_conn_ptr
     self.ble.conn_cb(self.conn_ptr, self.conn_buf)   # raises ble_error if BLE is not up yet
@@ -420,7 +465,7 @@ class InnoLuxCoreIoT
     tasmota.add_cron("*/10 * * * * *", /-> self.watchdog(), "inno_wd")
   end
 
-  # ---------- frame decoding ----------
+  # 11-byte frame: AA 0D 00 | meta[2] | float32 LE | xor | BB   (xor of bytes 0..9 == 0xFF)
   def decode_lux(f)
     if size(f) != 11 || f[0] != 0xAA || f[1] != 0x0D || f[2] != 0x00 || f[10] != 0xBB
       return nil
@@ -428,12 +473,11 @@ class InnoLuxCoreIoT
     var x = 0
     for i: 0..9  x = x ^ f[i]  end
     if x != 0xFF  return nil  end
-    var lux = f.getfloat(5)      # little-endian IEEE-754 float at offset 5
+    var lux = f.getfloat(5)
     if math.isnan(lux) || !(lux >= 0)  return nil  end
     return lux
   end
 
-  # ---------- advertisement handling ----------
   # adv_buf layout: MAC[6] | addr_type[1] | RSSI[1] | payload_len[1] | payload...
   def adv_name(b)
     var stop = 9 + b[8]
@@ -457,21 +501,19 @@ class InnoLuxCoreIoT
     self.busy = true
     var mac = self.adv_buf[0..5]
     var addr_type = self.adv_buf[6]
-    # Leave the driver callback before launching the connection
-    tasmota.set_timer(0, /-> self.connect(mac, addr_type))
+    tasmota.set_timer(0, /-> self.connect(mac, addr_type))   # leave the driver callback first
   end
 
   def connect(mac, addr_type)
-    self.ble.adv_cb(nil)              # stop listening while connected
+    self.ble.adv_cb(nil)
     print(string.format("InnoLuxBLE: found %s (%s), connecting...", self.target_name, mac.tohex()))
     self.ble.set_MAC(mac, addr_type)
     self.ble.set_svc(self.svc_uuid)
     self.ble.set_chr(self.tx_uuid)
     self.last_rx = tasmota.millis()
-    self.ble.run(3)                   # subscribe, stay connected
+    self.ble.run(3)              # subscribe, stay connected
   end
 
-  # ---------- connection / GATT events ----------
   def on_conn(err, op, uuid, handle)
     if err != 0
       print(string.format("InnoLuxBLE: error %d (op %d), rescanning in 5 s", err, op))
@@ -480,15 +522,15 @@ class InnoLuxCoreIoT
     end
     if op == 3
       print("InnoLuxBLE: subscribed to notifications")
-    elif op == 103               # notification data arrived
+    elif op == 103               # notification data
       var n = self.conn_buf[0]
       if n == 0 || n >= size(self.conn_buf)  return  end
       var lux = self.decode_lux(self.conn_buf[1 .. n])
       if lux != nil
         self.last_rx = tasmota.millis()
-        var payload = string.format('{"lux":%.2f}', lux)
-        mqtt.publish(self.TELEMETRY_TOPIC, payload)
-        print("InnoLuxBLE -> " + payload)
+        global.sensors["lux"] = lux
+        global.sensors["lux_ms"] = self.last_rx
+        log(string.format("InnoLuxBLE: %.2f lx", lux), 3)
       end
     elif op == 5
       print("InnoLuxBLE: disconnected, rescanning in 5 s")
@@ -499,7 +541,7 @@ class InnoLuxCoreIoT
   def watchdog()
     if self.busy && tasmota.millis() - self.last_rx > self.WATCHDOG_MS
       print("InnoLuxBLE: no data, dropping link")
-      self.ble.run(5)                 # disconnect
+      self.ble.run(5)
       self.schedule_rescan()
     end
   end
@@ -516,18 +558,14 @@ class InnoLuxCoreIoT
   end
 end
 
-# ---------- DHT20 (AHT20 inside, I2C 0x38) -> CoreIoT, independent of BLE ----------
-# Works on the current firmware: talks to the sensor directly over Berry I2C (tasmota.wire1/2).
-# If the firmware also has Tasmota's AHT2x driver, its readings are used instead.
-var DHT_PERIOD_S = 10
-var SDA_GPIO = 11              # Yolo-Uno I2C pins (check your board's labels)
-var SCL_GPIO = 12
-
+# =====================================================================
+#  DHT20 (AHT20 inside) over Berry I2C
+# =====================================================================
 class DHT20
   static ADDR = 0x38
   var w
 
-  def crc8(b, n)               # CRC-8, poly 0x31, init 0xFF
+  def crc8(b, n)                 # CRC-8, poly 0x31, init 0xFF
     var c = 0xFF
     for i: 0..n-1
       c = c ^ b[i]
@@ -555,13 +593,13 @@ class DHT20
     return true
   end
 
-  def trigger()                # start a measurement; result ready after ~80 ms
+  def trigger()                  # result ready after ~80 ms
     self.w.write_bytes(self.ADDR, 0xAC, bytes("3300"))
   end
 
-  def read()                   # returns [temperature, humidity] or nil
+  def read()                     # [temperature °C, humidity %RH] or nil
     var r = self.read_raw(7)
-    if size(r) < 7 || (r[0] & 0x80)  return nil  end          # short read or busy
+    if size(r) < 7 || (r[0] & 0x80)  return nil  end
     if self.crc8(r, 6) != r[6]  return nil  end
     var h = (r[1] << 12) | (r[2] << 4) | (r[3] >> 4)
     var t = ((r[3] & 0x0F) << 16) | (r[4] << 8) | r[5]
@@ -570,40 +608,77 @@ class DHT20
 end
 
 dht = DHT20()
-
-def dht_send(t, h)
-  if !mqtt.connected()  return  end
-  var payload = string.format('{"temperature":%.1f,"humidity":%.1f}', t, h)
-  mqtt.publish("v1/devices/me/telemetry", payload)
-  print("DHT20 -> " + payload)
-end
+dht_native = nil                 # true if Tasmota's own AHT2x driver reports the sensor
 
 def dht_cycle()
-  # 1) Tasmota AHT2x driver present (custom build with USE_AHT2x)?
-  var s = tasmota.read_sensors()
-  var j = (s != nil) ? json.load(s) : nil
-  if j != nil && j.contains("AHT2X")
-    var a = j["AHT2X"]
-    if a.contains("Temperature") && a.contains("Humidity")
-      dht_send(a["Temperature"], a["Humidity"])
-    end
-    return
+  if global.dht_native == nil
+    var s = tasmota.read_sensors()
+    var j = (s != nil) ? json.load(s) : nil
+    global.dht_native = (j != nil && j.contains("AHT2X"))
   end
-  # 2) Otherwise read the sensor directly over I2C
+  if global.dht_native  return  end          # AHT2x driver already puts it in SENSOR
   if !global.dht_ok
     global.dht_ok = global.dht.begin()
-    if !global.dht_ok  print("DHT20: not found at 0x38 (check wiring / I2C pins)")  return  end
+    if !global.dht_ok  log("DHT20: not found at 0x38 (check wiring / I2C pins)", 2)  return  end
   end
   global.dht.trigger()
   tasmota.set_timer(100, def ()
     var v = global.dht.read()
-    if v != nil  dht_send(v[0], v[1])  else  global.dht_ok = false  end
+    if v != nil
+      global.sensors["t"] = v[0]
+      global.sensors["h"] = v[1]
+      global.sensors["th_ms"] = tasmota.millis()
+      log(string.format("DHT20: %.1f C, %.1f %%RH", v[0], v[1]), 3)
+    else
+      global.dht_ok = false
+    end
   end)
 end
-tasmota.add_cron(string.format("*/%d * * * * *", DHT_PERIOD_S), dht_cycle, "dht_pub")
+tasmota.add_cron(string.format("*/%d * * * * *", DHT_PERIOD_S), dht_cycle, "dht_read")
 
-# ---------- One-time config: BLE on + I2C pins, then a single restart ----------
-def ensure_config()
+# =====================================================================
+#  Tasmota driver: add readings to SENSOR (MQTT) and the main web page
+# =====================================================================
+class GatewaySensors
+  static LUX_MAX_AGE_MS = 120000   # drop stale values instead of repeating them
+  static TH_MAX_AGE_MS  = 60000
+
+  def fresh(key_ms, max_age)
+    var ms = global.sensors[key_ms]
+    return ms != 0 && tasmota.millis() - ms < max_age
+  end
+
+  def json_append()
+    var s = global.sensors
+    if s["lux"] != nil && self.fresh("lux_ms", self.LUX_MAX_AGE_MS)
+      tasmota.response_append(string.format(',"InnoLux":{"Illuminance":%.1f}', s["lux"]))
+    end
+    if s["t"] != nil && self.fresh("th_ms", self.TH_MAX_AGE_MS)
+      tasmota.response_append(string.format(',"DHT20":{"Temperature":%.1f,"Humidity":%.1f}', s["t"], s["h"]))
+    end
+  end
+
+  def web_sensor()
+    var s = global.sensors
+    if s["lux"] != nil && self.fresh("lux_ms", self.LUX_MAX_AGE_MS)
+      tasmota.web_send(string.format("{s}InnoLux Illuminance{m}%.1f lx{e}", s["lux"]))
+    end
+    if s["t"] != nil && self.fresh("th_ms", self.TH_MAX_AGE_MS)
+      tasmota.web_send(string.format("{s}DHT20 Temperature{m}%.1f &deg;C{e}", s["t"]))
+      tasmota.web_send(string.format("{s}DHT20 Humidity{m}%.1f %%{e}", s["h"]))
+    end
+  end
+end
+tasmota.add_driver(GatewaySensors())
+
+# =====================================================================
+#  Setup: BLE on, I2C pins, TelePeriod; then start BLE
+# =====================================================================
+def ensure_config()               # returns true if a restart was issued
+  var tp = tasmota.cmd("TelePeriod")
+  if tp != nil && tp.find("TelePeriod") != TELE_PERIOD_S
+    tasmota.cmd(string.format("TelePeriod %d", TELE_PERIOD_S))   # no restart needed
+  end
   var cmds = []
   var so = tasmota.cmd("SetOption115")
   if so != nil && so.find("SetOption115") == "OFF"
@@ -620,20 +695,20 @@ def ensure_config()
   return true
 end
 
-# ---------- BLE start: enable driver if needed, then retry until the stack is up ----------
-def inno_start()
+def inno_start()                  # retry until the BLE driver is up (it starts after Wi-Fi)
   if global.innolux != nil  return  end
   try
-    import BLE                   # raises ble_error until Wi-Fi is up and the BLE driver has started
-    global.innolux = InnoLuxCoreIoT(BLE)
+    import BLE
+    global.innolux = InnoLuxBLE(BLE)
   except .. as e, m
     print("InnoLuxBLE: BLE not ready (" + str(m) + "), retrying in 5 s")
     global.innolux = nil
     tasmota.set_timer(5000, inno_start)
   end
 end
+
 tasmota.add_rule("System#Boot", def ()
-  if ensure_config()  return  end          # restarting to apply settings
+  if ensure_config()  return  end
   tasmota.set_timer(5000, inno_start)
 end)
 ```
@@ -642,7 +717,7 @@ end)
 
 Not needed for the gateway to work. Place it in `D:\Tasmota\tasmota\` and rebuild only if you want:
 
-- **Wi-Fi and CoreIoT built in**, so a freshly flashed board connects with no web setup (uncomment and fill in the blocks; don't share a firmware file that has your token built in);
+- **Wi-Fi and MQTT built in**, so a freshly flashed board connects with no web setup (uncomment and fill in the blocks; don't share a firmware file that has your Wi-Fi password built in);
 - **first-boot commands** that apply BLE, active scanning and the I2C pins straight away;
 - **Tasmota's AHT2x driver**, which shows the DHT20 on the main web page and in Tasmota's own sensor messages. The script then uses its readings.
 
@@ -656,7 +731,7 @@ Defaults and `USER_BACKLOG` apply only after a fresh flash (`erase-flash`) or `R
   Firmware defaults for the Yolo-Uno gateway:
     - AHT2x driver for the DHT20 (an AHT20 inside, I2C address 0x38)
     - First-boot commands: enable BLE, active scan, I2C on GPIO11 (SDA) / GPIO12 (SCL)
-    - Optional: Wi-Fi and CoreIoT MQTT defaults (uncomment and fill in)
+    - Optional: Wi-Fi and MQTT defaults (uncomment and fill in)
 
   Defaults and USER_BACKLOG apply on a fresh flash (after erase-flash) or after `Reset 1`.
   An OTA upgrade keeps the existing settings, so they are not applied then.
@@ -686,17 +761,21 @@ Defaults and `USER_BACKLOG` apply only after a fresh flash (`erase-flash`) or `R
 // #undef  STA_PASS1
 // #define STA_PASS1      "YourWifiPassword"
 
-// ---- Optional: CoreIoT MQTT defaults (uncomment and fill in) ----
+// ---- Optional: MQTT defaults for ThingsBoard via broker.emqx.io (uncomment) ----
 // #undef  MQTT_HOST
-// #define MQTT_HOST      "app.coreiot.io"
+// #define MQTT_HOST      "broker.emqx.io"
 // #undef  MQTT_PORT
 // #define MQTT_PORT      1883
 // #undef  MQTT_USER
-// #define MQTT_USER      "YOUR_COREIOT_DEVICE_ACCESS_TOKEN"
+// #define MQTT_USER      ""
 // #undef  MQTT_PASS
 // #define MQTT_PASS      ""
 // #undef  MQTT_TOPIC
-// #define MQTT_TOPIC     "devices/me"
+// #define MQTT_TOPIC     "sensor1"                      // device name on ThingsBoard
+// #undef  MQTT_FULLTOPIC
+// #define MQTT_FULLTOPIC "tbch_8x4k/%prefix%/%topic%/"
+// #undef  TELE_PERIOD
+// #define TELE_PERIOD    10
 
 #endif  // _USER_CONFIG_OVERRIDE_H_
 ```

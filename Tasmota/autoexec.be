@@ -1,24 +1,45 @@
-# Yolo-Uno (ESP32-S3) Tasmota gateway -> CoreIoT (v1/devices/me/telemetry)
-#   - InnoLab BLE light sensor (inno-013-7985) via legacy MI32 Berry BLE  -> {"lux":..}
-#   - DHT20 (AHT20, I2C 0x38) via Berry I2C (or Tasmota AHT2x if built in) -> {"temperature":..,"humidity":..}
-# Firmware: env tasmota32s3-mi32 (needed for BLE). DHT20 is read directly over Berry I2C,
-# so no extra firmware option is needed. SetOption115 and the I2C pins are set automatically.
+# Yolo-Uno (ESP32-S3) Tasmota gateway -> ThingsBoard (codehelpers.tech) via broker.emqx.io
+#
+#   - InnoLab BLE light sensor (inno-013-7985) via legacy MI32 Berry BLE
+#   - DHT20 (AHT20, I2C 0x38) via Berry I2C (or Tasmota AHT2x driver if built in)
+#
+# Readings are added to Tasmota's standard SENSOR message, so Tasmota itself publishes them to
+#   <FullTopic>  tbch_8x4k/tele/<Topic>/SENSOR   (e.g. tbch_8x4k/tele/sensor1/SENSOR)
+# every TelePeriod, e.g.
+#   {"Time":"...","InnoLux":{"Illuminance":145.2},"DHT20":{"Temperature":28.4,"Humidity":71.3}}
+# The ThingsBoard converter maps these to illuminance / temperature / humidity
+# (plus InnoLux_Illuminance, DHT20_Temperature, DHT20_Humidity).
+#
+# MQTT settings (Configuration -> Configure MQTT): Host broker.emqx.io, Port 1883,
+# User/Password empty, Topic sensor1, Full Topic tbch_8x4k/%prefix%/%topic%/
+#
+# Firmware: env tasmota32s3-mi32 (needed for BLE). SetOption115, I2C pins and TelePeriod are
+# set automatically.
 
-import mqtt
 import math
 import string
 import cb
 import global
 import json
 
+# ---------------- settings ----------------
+var TELE_PERIOD_S = 10         # how often Tasmota publishes SENSOR (min 10)
+var DHT_PERIOD_S  = 10         # how often the DHT20 is read
+var SDA_GPIO = 11              # Yolo-Uno I2C pins (check your board's labels)
+var SCL_GPIO = 12
+
 # Globals declared up front (Berry strict mode); callback pointers created ONCE
 innolux = nil
 dht = nil
 dht_ok = false
+sensors = {"lux": nil, "lux_ms": 0, "t": nil, "h": nil, "th_ms": 0}
 inno_adv_ptr  = cb.gen_cb(/svc, manu -> (global.innolux != nil ? global.innolux.on_adv(svc, manu) : nil))
 inno_conn_ptr = cb.gen_cb(/err, op, uuid, handle -> (global.innolux != nil ? global.innolux.on_conn(err, op, uuid, handle) : nil))
 
-class InnoLuxCoreIoT
+# =====================================================================
+#  InnoLab BLE light sensor
+# =====================================================================
+class InnoLuxBLE
   var ble                        # BLE module, imported once the stack is up
   var target_name, svc_uuid, tx_uuid
   var adv_buf, conn_buf
@@ -26,7 +47,6 @@ class InnoLuxCoreIoT
   var busy                       # true while connecting / connected
   var last_rx                    # millis of last valid frame
 
-  static TELEMETRY_TOPIC = "v1/devices/me/telemetry"
   static WATCHDOG_MS = 60000     # no data for 60 s -> drop link and rescan
 
   def init(ble)
@@ -39,10 +59,8 @@ class InnoLuxCoreIoT
     self.busy = false
     self.last_rx = 0
 
-    # Active scanning so the device name in the scan response is received
-    tasmota.cmd("MI32Option4 1")
+    tasmota.cmd("MI32Option4 1") # active scanning: names arrive in scan responses
 
-    # Callback pointers are created once at file level (gen_cb has limited slots)
     self.adv_ptr  = inno_adv_ptr
     self.conn_ptr = inno_conn_ptr
     self.ble.conn_cb(self.conn_ptr, self.conn_buf)   # raises ble_error if BLE is not up yet
@@ -52,7 +70,7 @@ class InnoLuxCoreIoT
     tasmota.add_cron("*/10 * * * * *", /-> self.watchdog(), "inno_wd")
   end
 
-  # ---------- frame decoding ----------
+  # 11-byte frame: AA 0D 00 | meta[2] | float32 LE | xor | BB   (xor of bytes 0..9 == 0xFF)
   def decode_lux(f)
     if size(f) != 11 || f[0] != 0xAA || f[1] != 0x0D || f[2] != 0x00 || f[10] != 0xBB
       return nil
@@ -60,12 +78,11 @@ class InnoLuxCoreIoT
     var x = 0
     for i: 0..9  x = x ^ f[i]  end
     if x != 0xFF  return nil  end
-    var lux = f.getfloat(5)      # little-endian IEEE-754 float at offset 5
+    var lux = f.getfloat(5)
     if math.isnan(lux) || !(lux >= 0)  return nil  end
     return lux
   end
 
-  # ---------- advertisement handling ----------
   # adv_buf layout: MAC[6] | addr_type[1] | RSSI[1] | payload_len[1] | payload...
   def adv_name(b)
     var stop = 9 + b[8]
@@ -89,21 +106,19 @@ class InnoLuxCoreIoT
     self.busy = true
     var mac = self.adv_buf[0..5]
     var addr_type = self.adv_buf[6]
-    # Leave the driver callback before launching the connection
-    tasmota.set_timer(0, /-> self.connect(mac, addr_type))
+    tasmota.set_timer(0, /-> self.connect(mac, addr_type))   # leave the driver callback first
   end
 
   def connect(mac, addr_type)
-    self.ble.adv_cb(nil)              # stop listening while connected
+    self.ble.adv_cb(nil)
     print(string.format("InnoLuxBLE: found %s (%s), connecting...", self.target_name, mac.tohex()))
     self.ble.set_MAC(mac, addr_type)
     self.ble.set_svc(self.svc_uuid)
     self.ble.set_chr(self.tx_uuid)
     self.last_rx = tasmota.millis()
-    self.ble.run(3)                   # subscribe, stay connected
+    self.ble.run(3)              # subscribe, stay connected
   end
 
-  # ---------- connection / GATT events ----------
   def on_conn(err, op, uuid, handle)
     if err != 0
       print(string.format("InnoLuxBLE: error %d (op %d), rescanning in 5 s", err, op))
@@ -112,15 +127,15 @@ class InnoLuxCoreIoT
     end
     if op == 3
       print("InnoLuxBLE: subscribed to notifications")
-    elif op == 103               # notification data arrived
+    elif op == 103               # notification data
       var n = self.conn_buf[0]
       if n == 0 || n >= size(self.conn_buf)  return  end
       var lux = self.decode_lux(self.conn_buf[1 .. n])
       if lux != nil
         self.last_rx = tasmota.millis()
-        var payload = string.format('{"lux":%.2f}', lux)
-        mqtt.publish(self.TELEMETRY_TOPIC, payload)
-        print("InnoLuxBLE -> " + payload)
+        global.sensors["lux"] = lux
+        global.sensors["lux_ms"] = self.last_rx
+        log(string.format("InnoLuxBLE: %.2f lx", lux), 3)
       end
     elif op == 5
       print("InnoLuxBLE: disconnected, rescanning in 5 s")
@@ -131,7 +146,7 @@ class InnoLuxCoreIoT
   def watchdog()
     if self.busy && tasmota.millis() - self.last_rx > self.WATCHDOG_MS
       print("InnoLuxBLE: no data, dropping link")
-      self.ble.run(5)                 # disconnect
+      self.ble.run(5)
       self.schedule_rescan()
     end
   end
@@ -148,18 +163,14 @@ class InnoLuxCoreIoT
   end
 end
 
-# ---------- DHT20 (AHT20 inside, I2C 0x38) -> CoreIoT, independent of BLE ----------
-# Works on the current firmware: talks to the sensor directly over Berry I2C (tasmota.wire1/2).
-# If the firmware also has Tasmota's AHT2x driver, its readings are used instead.
-var DHT_PERIOD_S = 10
-var SDA_GPIO = 11              # Yolo-Uno I2C pins (check your board's labels)
-var SCL_GPIO = 12
-
+# =====================================================================
+#  DHT20 (AHT20 inside) over Berry I2C
+# =====================================================================
 class DHT20
   static ADDR = 0x38
   var w
 
-  def crc8(b, n)               # CRC-8, poly 0x31, init 0xFF
+  def crc8(b, n)                 # CRC-8, poly 0x31, init 0xFF
     var c = 0xFF
     for i: 0..n-1
       c = c ^ b[i]
@@ -187,13 +198,13 @@ class DHT20
     return true
   end
 
-  def trigger()                # start a measurement; result ready after ~80 ms
+  def trigger()                  # result ready after ~80 ms
     self.w.write_bytes(self.ADDR, 0xAC, bytes("3300"))
   end
 
-  def read()                   # returns [temperature, humidity] or nil
+  def read()                     # [temperature °C, humidity %RH] or nil
     var r = self.read_raw(7)
-    if size(r) < 7 || (r[0] & 0x80)  return nil  end          # short read or busy
+    if size(r) < 7 || (r[0] & 0x80)  return nil  end
     if self.crc8(r, 6) != r[6]  return nil  end
     var h = (r[1] << 12) | (r[2] << 4) | (r[3] >> 4)
     var t = ((r[3] & 0x0F) << 16) | (r[4] << 8) | r[5]
@@ -202,40 +213,77 @@ class DHT20
 end
 
 dht = DHT20()
-
-def dht_send(t, h)
-  if !mqtt.connected()  return  end
-  var payload = string.format('{"temperature":%.1f,"humidity":%.1f}', t, h)
-  mqtt.publish("v1/devices/me/telemetry", payload)
-  print("DHT20 -> " + payload)
-end
+dht_native = nil                 # true if Tasmota's own AHT2x driver reports the sensor
 
 def dht_cycle()
-  # 1) Tasmota AHT2x driver present (custom build with USE_AHT2x)?
-  var s = tasmota.read_sensors()
-  var j = (s != nil) ? json.load(s) : nil
-  if j != nil && j.contains("AHT2X")
-    var a = j["AHT2X"]
-    if a.contains("Temperature") && a.contains("Humidity")
-      dht_send(a["Temperature"], a["Humidity"])
-    end
-    return
+  if global.dht_native == nil
+    var s = tasmota.read_sensors()
+    var j = (s != nil) ? json.load(s) : nil
+    global.dht_native = (j != nil && j.contains("AHT2X"))
   end
-  # 2) Otherwise read the sensor directly over I2C
+  if global.dht_native  return  end          # AHT2x driver already puts it in SENSOR
   if !global.dht_ok
     global.dht_ok = global.dht.begin()
-    if !global.dht_ok  print("DHT20: not found at 0x38 (check wiring / I2C pins)")  return  end
+    if !global.dht_ok  log("DHT20: not found at 0x38 (check wiring / I2C pins)", 2)  return  end
   end
   global.dht.trigger()
   tasmota.set_timer(100, def ()
     var v = global.dht.read()
-    if v != nil  dht_send(v[0], v[1])  else  global.dht_ok = false  end
+    if v != nil
+      global.sensors["t"] = v[0]
+      global.sensors["h"] = v[1]
+      global.sensors["th_ms"] = tasmota.millis()
+      log(string.format("DHT20: %.1f C, %.1f %%RH", v[0], v[1]), 3)
+    else
+      global.dht_ok = false
+    end
   end)
 end
-tasmota.add_cron(string.format("*/%d * * * * *", DHT_PERIOD_S), dht_cycle, "dht_pub")
+tasmota.add_cron(string.format("*/%d * * * * *", DHT_PERIOD_S), dht_cycle, "dht_read")
 
-# ---------- One-time config: BLE on + I2C pins, then a single restart ----------
-def ensure_config()
+# =====================================================================
+#  Tasmota driver: add readings to SENSOR (MQTT) and the main web page
+# =====================================================================
+class GatewaySensors
+  static LUX_MAX_AGE_MS = 120000   # drop stale values instead of repeating them
+  static TH_MAX_AGE_MS  = 60000
+
+  def fresh(key_ms, max_age)
+    var ms = global.sensors[key_ms]
+    return ms != 0 && tasmota.millis() - ms < max_age
+  end
+
+  def json_append()
+    var s = global.sensors
+    if s["lux"] != nil && self.fresh("lux_ms", self.LUX_MAX_AGE_MS)
+      tasmota.response_append(string.format(',"InnoLux":{"Illuminance":%.1f}', s["lux"]))
+    end
+    if s["t"] != nil && self.fresh("th_ms", self.TH_MAX_AGE_MS)
+      tasmota.response_append(string.format(',"DHT20":{"Temperature":%.1f,"Humidity":%.1f}', s["t"], s["h"]))
+    end
+  end
+
+  def web_sensor()
+    var s = global.sensors
+    if s["lux"] != nil && self.fresh("lux_ms", self.LUX_MAX_AGE_MS)
+      tasmota.web_send(string.format("{s}InnoLux Illuminance{m}%.1f lx{e}", s["lux"]))
+    end
+    if s["t"] != nil && self.fresh("th_ms", self.TH_MAX_AGE_MS)
+      tasmota.web_send(string.format("{s}DHT20 Temperature{m}%.1f &deg;C{e}", s["t"]))
+      tasmota.web_send(string.format("{s}DHT20 Humidity{m}%.1f %%{e}", s["h"]))
+    end
+  end
+end
+tasmota.add_driver(GatewaySensors())
+
+# =====================================================================
+#  Setup: BLE on, I2C pins, TelePeriod; then start BLE
+# =====================================================================
+def ensure_config()               # returns true if a restart was issued
+  var tp = tasmota.cmd("TelePeriod")
+  if tp != nil && tp.find("TelePeriod") != TELE_PERIOD_S
+    tasmota.cmd(string.format("TelePeriod %d", TELE_PERIOD_S))   # no restart needed
+  end
   var cmds = []
   var so = tasmota.cmd("SetOption115")
   if so != nil && so.find("SetOption115") == "OFF"
@@ -252,19 +300,19 @@ def ensure_config()
   return true
 end
 
-# ---------- BLE start: enable driver if needed, then retry until the stack is up ----------
-def inno_start()
+def inno_start()                  # retry until the BLE driver is up (it starts after Wi-Fi)
   if global.innolux != nil  return  end
   try
-    import BLE                   # raises ble_error until Wi-Fi is up and the BLE driver has started
-    global.innolux = InnoLuxCoreIoT(BLE)
+    import BLE
+    global.innolux = InnoLuxBLE(BLE)
   except .. as e, m
     print("InnoLuxBLE: BLE not ready (" + str(m) + "), retrying in 5 s")
     global.innolux = nil
     tasmota.set_timer(5000, inno_start)
   end
 end
+
 tasmota.add_rule("System#Boot", def ()
-  if ensure_config()  return  end          # restarting to apply settings
+  if ensure_config()  return  end
   tasmota.set_timer(5000, inno_start)
 end)
