@@ -98,6 +98,8 @@ async def authorize_rpc(config, profile_id, device_id, method, params):
     """Refresh and validate against the same registry used by the MCP server."""
     if not profile_id:
         return 'An agent profile is required for RPC authorization.'
+    registry = None
+    resolved_id = None
     try:
         connection, registry, _ = _create_mcp_runtime(config, profile_id)
         await registry.refresh()
@@ -106,7 +108,17 @@ async def authorize_rpc(config, profile_id, device_id, method, params):
         return None
     except Exception as exc:
         if exc.__class__.__name__ in ('CapabilityError', 'DeviceNotFoundError'):
-            return f'RPC not sent: capability discovery or parameter validation failed ({exc})'
+            message = f'RPC not sent: capability discovery or parameter validation failed ({exc})'
+            if registry is not None and resolved_id and exc.__class__.__name__ == 'CapabilityError':
+                available = [
+                    {'method': item['method'], 'params': item['parameter_schema']}
+                    for item in registry.list(resolved_id) if item.get('schema_complete')
+                ]
+                if "is not of type 'boolean'" in str(exc):
+                    message += ' Use unquoted JSON booleans true or false (not strings).'
+                if available:
+                    message += f' Available methods for this device: {json.dumps(available, ensure_ascii=False)}.'
+            return message
         return 'RPC not sent: capability discovery or parameter validation failed.'
 
 
@@ -121,6 +133,8 @@ async def execute(client, config, name, args, read_only=False, profile_id=None):
         if name == 'discover_capabilities':
             if not profile_id:
                 return {'success': False, 'error': 'An agent profile is required.'}
+            if (args.get('device_identifier') or args.get('device_name') or args.get('device_id') or '').strip():
+                return await execute(client, config, 'list_available_rpc', args, read_only=read_only, profile_id=profile_id)
             _, _, mcp_tools = _create_mcp_runtime(config, profile_id)
             return redact_credentials(await mcp_tools['discover_capabilities'](), key)
 

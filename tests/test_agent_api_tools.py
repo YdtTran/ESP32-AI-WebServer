@@ -244,11 +244,14 @@ class AgentApiToolsTests(unittest.IsolatedAsyncioTestCase):
                 {'device_identifier': 'Simulated Tasmota B', 'method': 'togglePower', 'params': {}}, profile_id='agent-a')
             self.assertFalse(bad_method['success'])
             self.assertEqual(bad_method['error_code'], 'unsupported_method')
+            self.assertIn('setPower', bad_method['error'])
+            self.assertIn('"state"', bad_method['error'])
 
             bad_params = await api_tools.execute(http, config, 'execute_device_action',
                 {'device_identifier': 'Simulated Tasmota A', 'method': 'setPower', 'params': {'state': 'yes'}}, profile_id='agent-a')
             self.assertFalse(bad_params['success'])
             self.assertEqual(bad_params['error_code'], 'invalid_params')
+            self.assertIn('Available methods for this device', bad_params['error'])
 
             denied_ro = await api_tools.execute(http, config, 'execute_device_action',
                 {'device_identifier': 'Simulated Tasmota A', 'method': 'setPower', 'params': {'state': True}},
