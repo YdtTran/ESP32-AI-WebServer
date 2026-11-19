@@ -255,6 +255,13 @@ async def execute(client, config, name, args, read_only=False, profile_id=None):
                  'two_way': two_way, 'timeout_ms': timeout_ms},
                 read_only=read_only, profile_id=profile_id,
             )
+            if rpc_result.get('error_code') == 'device_not_found' and 'devices' not in rpc_result:
+                try:
+                    devices = await _all_devices(client, host, headers)
+                    rpc_result['devices'] = [{'name': d.get('name'), 'label': d.get('label'),
+                                              'id': d.get('id', {}).get('id')} for d in devices]
+                except Exception:
+                    pass
             return {'status': 'success' if rpc_result.get('success') else 'error',
                     'device': resolved_name, 'device_id': device_id, 'method': method, **rpc_result}
 
@@ -296,7 +303,11 @@ async def execute(client, config, name, args, read_only=False, profile_id=None):
             payload = {'method': method, 'params': {} if raw_params is None else raw_params}
             error = await authorize_rpc(config, profile_id, device_id, method, payload['params'])
             if error:
-                error_code = 'invalid_params' if 'Invalid parameters' in error else 'unsupported_method'
+                error_code = (
+                    'invalid_params' if 'Invalid parameters' in error
+                    else 'device_not_found' if 'not found' in error.lower()
+                    else 'unsupported_method'
+                )
                 return {'success': False, 'confirmed': False, 'delivery': 'failed',
                         'error_code': error_code, 'error': error}
             if mode == 'twoway':
@@ -392,6 +403,7 @@ MCP_TOOLS = [
                 'type': 'object',
                 'properties': {
                     'device_name': {'type': 'string', 'description': 'Exact name or UUID of the target ThingsBoard device.'},
+                    'keys': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Optional telemetry keys to fetch (e.g. ["temperature", "humidity", "POWER"]).'},
                 },
                 'required': ['device_name'],
             },
@@ -401,11 +413,11 @@ MCP_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'execute_device_action',
-            'description': 'Validate and execute a registered RPC action on a ThingsBoard device through the capability registry (two-way confirmation by default).',
+            'description': 'Validate and execute a registered RPC action on a ThingsBoard device through the capability registry (two-way confirmation by default). Prefer exact device names over guessing UUIDs.',
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'device_identifier': {'type': 'string', 'description': 'Exact target device name or UUID.'},
+                    'device_identifier': {'type': 'string', 'description': 'Exact target device name (preferred) or verified UUID from list_devices.'},
                     'method': {'type': 'string', 'description': 'Registered RPC method name from list_available_rpc.'},
                     'params': {'description': 'JSON parameters matching the discovered parameter schema.'},
                     'two_way': {'type': 'boolean', 'description': 'Wait for confirmed device response (default true).'},
