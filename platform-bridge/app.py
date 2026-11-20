@@ -508,14 +508,14 @@ async def run_agent_chat(agent: Dict[str, Any], req: AgentChatRequest):
             "parameters": {"type": "object", "properties": {}},
         }}
     ]
-    prompt += ("\nComplete the request in this response. Use the available ThingsBoard MCP tools "
-               "for live data and control; never say you are waiting without calling a tool. "
-               "If a tool fails, explain the failure instead of inventing data or success. "
-               "Only send RPC when the user explicitly requests a device action; do not guess the device, method, or parameters. "
-               "Before controlling a device, call list_devices and list_available_rpc (or discover_capabilities) "
-               "and use only registered methods and schema-valid parameters via execute_device_action or send_rpc. "
-               "If device lookup fails, use the returned device list to identify the exact device. "
-               "Never repeat an RPC after it was sent and failed or timed out without the user requesting another attempt.")
+    prompt += ("\nComplete the request in this response using ThingsBoard MCP tools; never invent data or success. "
+               "Only send RPC when explicitly asked to control a device. "
+               "Use list_available_rpc for the target device (or list_devices first if unsure) and prefer exact device names over guessing UUIDs. "
+               "Use setPower with {\"state\": true} for on/bật, {\"state\": false} for off/tắt, and togglePower only for toggle/đảo trạng thái if registered. "
+               "Never control an unrelated device if the requested device is not in list_devices, and never call setPower or togglePower for unsupported actions (brightness, dimmer, timer, color) — refuse and list the supported methods instead. "
+               "For conditional requests (if temp > X), read telemetry first and only call RPC in a later turn if the condition is true. "
+               "If execute_device_action returns 'RPC not sent' with available methods/schemas, retry immediately with the exact registered method and params. "
+               "Never repeat an RPC after it was already sent.")
     messages = [{"role": "system", "content": prompt}]
     for h in (req.history or [])[-6:]:
         r = h.get("role")
@@ -575,10 +575,47 @@ async def run_agent_chat(agent: Dict[str, Any], req: AgentChatRequest):
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
             waiting_retried = False
+            empty_retried = False
+            action_nudges = 0
+            described_action_re = re.compile(
+                r'<\s*/?\s*(?:tools?|tool_call)\b'
+                r'|`(?:execute_device_action|send_rpc|thingsboard_rpc|list_available_rpc|discover_capabilities)`'
+                r'|(?:sẽ|sẽ tiến hành)\s+(?:gọi|gửi|thực hiện|dùng|sử dụng|bật|tắt|điều khiển)\b'
+                r'|(?:i will|i\'ll|we will|we\'ll|let\'s|let me)\s+(?:call|send|execute|use|proceed|turn|set|toggle|control)\b',
+                re.IGNORECASE,
+            )
+            unverified_action_re = re.compile(
+                r'\b(?:has|have)\s+been\s+(?:\w+\s+)?(?:sent|submitted|executed|dispatched|triggered|set|updated|changed|turned\s+(?:on|off)|switched\s+(?:on|off)|powered\s+(?:on|off)|toggled|applied)\b'
+                r'|\b(?:device|relay|switch)\s+has\s+(?:\w+\s+)?(?:received|processed|executed|acknowledged)\b'
+                r'|\b(?:i|we)\s+(?:have\s+)?(?:\w+\s+)?(?:sent|submitted|executed|set|turned\s+(?:on|off)|switched\s+(?:on|off)|powered\s+(?:on|off)|toggled)\b.*\b(?:command|rpc|power|device|relay|switch|tasmota)\b'
+                r'|\bđã\s+(?:được\s+)?(?:bật|tắt|đặt|cập\s+nhật|gửi|gọi|thực\s+hiện|chuyển|kích\s+hoạt|điều\s+khiển)\b',
+                re.IGNORECASE,
+            )
+            control_request_re = re.compile(
+                r'^(?!.*\?)(?:(?:(?:hãy|vui lòng)\s+)?(?:bật|tắt|ngắt|đảo\s+trạng\s+thái)\b'
+                r'|(?!.*\b(?:đang|là gì|bao nhiêu|như thế nào|status|what|which|is|are|check|kiểm tra|xem)\b)'
+                r'.*(?:\b(?:bật|tắt|ngắt|đảo trạng thái)\b|\b(?:turn|switch|power)\s+(?:on|off)\b|\b(?:toggle|set\s+power)\b))',
+                re.IGNORECASE,
+            )
+            not_found_reply_re = re.compile(
+                r'\?|\b(?:not found|cannot find|could not find|does not exist|no (?:such )?device|ambiguous|specify|clarify|which device|which one|please provide|cannot|unable|unsupported|không tìm thấy|không có thiết bị|không tồn tại|không hỗ trợ|mơ hồ|chọn|cụ thể|thiết bị nào)\b',
+                re.IGNORECASE,
+            )
+            can_control = bool(tb_host and tb_key and agent.get("tool_policy") != "read_only_telemetry")
+            is_control_request = can_control and bool(control_request_re.search(user_text))
+            def _rpc_dispatched(tool):
+                if tool['name'] not in ('send_rpc', 'thingsboard_rpc', 'execute_device_action'):
+                    return False
+                try:
+                    res = json.loads(tool['result'])
+                except (ValueError, TypeError):
+                    return True
+                return res.get('error_code') not in ('unsupported_method', 'invalid_params', 'device_not_found', 'forbidden')
+
             for attempt in range(6):
                 model_response = await client.post(
                     f"{ollama_url}/v1/chat/completions",
-                    json={"model": model_name, "messages": messages, "tools": tb_tools, "stream": False}
+                    json={"model": model_name, "messages": messages, "tools": tb_tools, "stream": False, "temperature": 0.1 if empty_retried else 0}
                 )
                 model_response.raise_for_status()
                 msg = model_response.json().get("choices", [{}])[0].get("message", {})
@@ -586,26 +623,46 @@ async def run_agent_chat(agent: Dict[str, Any], req: AgentChatRequest):
                 if not tool_calls:
                     content = (msg.get("content") or "").strip()
                     if not content:
+                        if not empty_retried:
+                            empty_retried = True
+                            continue
                         raise ValueError("Model returned an empty response")
-                    if re.search(r'<\s*/?\s*(?:tools?|tool_call)\b|(?:sẽ|sẽ tiến hành)\s+(?:gọi|gửi|thực hiện)\b|(?:i will|i\'ll)\s+(?:call|send|execute)\b', content, re.IGNORECASE):
-                        rpc_sent = any(tool['name'] in ('send_rpc', 'thingsboard_rpc', 'execute_device_action') for tool in executed_tools)
-                        if waiting_retried or rpc_sent:
+                    rpc_attempted = any(tool['name'] in ('send_rpc', 'thingsboard_rpc', 'execute_device_action') for tool in executed_tools)
+                    rpc_sent = any(_rpc_dispatched(tool) for tool in executed_tools)
+                    if described_action_re.search(content):
+                        if action_nudges >= 2 or rpc_sent:
                             content = ("Tôi chưa thể xác nhận yêu cầu điều khiển đã hoàn tất." if agent.get("language", "vi") == "vi"
                                        else "I could not confirm that the control request completed.")
                         else:
-                            waiting_retried = True
-                            messages.append({"role": "system", "content": "Do not describe a tool call in text. Call the appropriate tool using structured tool calls, or explain why you cannot."})
+                            action_nudges += 1
+                            # Qwen2.5's Ollama template drops role="system" messages after index 0, so nudges use user turns.
+                            messages.append({"role": "assistant", "content": "I have not called the device tool yet."})
+                            messages.append({"role": "user", "content": f"Do not describe the tool call in text. Call execute_device_action (or list_available_rpc) now for {user_text!r} using a structured tool call (state=true for on/bật, state=false for off/tắt)."})
                             continue
-                    if re.search(r"please wait|hold on|one moment|(?:i will|i'll) (?:get|fetch|retrieve|check)|(?:hãy|vui lòng) (?:đợi|chờ)|đợi một chút|(?:đang|sẽ) (?:lấy|tìm|truy xuất|kiểm tra)", content, re.IGNORECASE):
+                    missing_control_rpc = (
+                        is_control_request and not rpc_attempted
+                        and not (executed_tools and not_found_reply_re.search(content))
+                    )
+                    if not rpc_sent and (unverified_action_re.search(content) or missing_control_rpc):
+                        if action_nudges >= 2:
+                            content = ("Tôi chưa thể xác nhận yêu cầu điều khiển đã hoàn tất." if agent.get("language", "vi") == "vi"
+                                       else "I could not confirm that the control request completed.")
+                        else:
+                            action_nudges += 1
+                            messages.append({"role": "assistant", "content": "I have not executed the device action yet."})
+                            messages.append({"role": "user", "content": f"No RPC tool was called yet for {user_text!r}. Call execute_device_action now using a registered method (setPower with state=true for on/bật, state=false for off/tắt, togglePower for toggle/đảo trạng thái; call list_available_rpc first if needed, or say not found if the device does not exist)."})
+                            continue
+                    if not rpc_sent and re.search(r"please wait|hold on|one moment|(?:i will|i'll) (?:get|fetch|retrieve|check)|(?:hãy|vui lòng) (?:đợi|chờ)|đợi một chút|(?:đang|sẽ) (?:lấy|tìm|truy xuất|kiểm tra)", content, re.IGNORECASE):
                         if waiting_retried:
                             content = ("Tôi chưa thể hoàn thành yêu cầu này." if agent.get("language", "vi") == "vi"
                                        else "I could not complete this request.")
                         else:
                             waiting_retried = True
-                            messages.append({"role": "system", "content": "Do not ask the user to wait. Call the necessary tool now or explain clearly why you cannot complete the request."})
+                            messages.append({"role": "assistant", "content": content})
+                            messages.append({"role": "user", "content": "Do not ask me to wait. Call the necessary tool now or explain clearly why you cannot complete the request."})
                             continue
                     return {"reply": content, "tool_calls": executed_tools}
-                messages.append(msg)
+                messages.append({**msg, "content": ""})
                 for tc in tool_calls:
                     fn = tc.get("function", {})
                     tc_id = tc.get("id", "call_default")
@@ -625,7 +682,17 @@ async def run_agent_chat(agent: Dict[str, Any], req: AgentChatRequest):
                     executed_tools.append({"id": tc_id, "name": fn_name,
                         "arguments": json.dumps(args, ensure_ascii=False), "result": tool_res_str})
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_res_str})
-            raise ValueError("Model exceeded the tool-call limit")
+            # Wrap up gracefully without tools if the model spent all rounds calling tools.
+            final_response = await client.post(
+                f"{ollama_url}/v1/chat/completions",
+                json={"model": model_name, "messages": messages, "stream": False, "temperature": 0}
+            )
+            final_response.raise_for_status()
+            final_content = (final_response.json().get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            if not final_content:
+                final_content = ("Tôi chưa thể hoàn thành yêu cầu này." if agent.get("language", "vi") == "vi"
+                                 else "I could not complete this request.")
+            return {"reply": final_content, "tool_calls": executed_tools}
 
     except Exception as e:
         logger.error("Error during agent chat inference: %s", e)

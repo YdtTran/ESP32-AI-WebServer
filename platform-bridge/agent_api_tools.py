@@ -82,6 +82,10 @@ async def _all_devices(client, host, headers):
         page += 1
 
 
+def _normalize_device_name(value):
+    return re.sub(r'[\s_-]+', ' ', value or '').strip().casefold()
+
+
 def _matching_device(devices, name):
     if not name:
         return None
@@ -91,13 +95,26 @@ def _matching_device(devices, name):
         (d.get("label") or "").casefold(),
         (d.get("id", {}).get("id") or "").casefold(),
     )]
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        return None
+    norm_target = _normalize_device_name(name)
+    if not norm_target:
+        return None
+    norm_matches = [d for d in devices if norm_target in (
+        _normalize_device_name(d.get("name")),
+        _normalize_device_name(d.get("label")),
+    )]
+    return norm_matches[0] if len(norm_matches) == 1 else None
 
 
 async def authorize_rpc(config, profile_id, device_id, method, params):
     """Refresh and validate against the same registry used by the MCP server."""
     if not profile_id:
         return 'An agent profile is required for RPC authorization.'
+    registry = None
+    resolved_id = None
     try:
         connection, registry, _ = _create_mcp_runtime(config, profile_id)
         await registry.refresh()
@@ -106,7 +123,17 @@ async def authorize_rpc(config, profile_id, device_id, method, params):
         return None
     except Exception as exc:
         if exc.__class__.__name__ in ('CapabilityError', 'DeviceNotFoundError'):
-            return f'RPC not sent: capability discovery or parameter validation failed ({exc})'
+            message = f'RPC not sent: capability discovery or parameter validation failed ({exc})'
+            if registry is not None and resolved_id and exc.__class__.__name__ == 'CapabilityError':
+                available = [
+                    {'method': item['method'], 'params': item['parameter_schema']}
+                    for item in registry.list(resolved_id) if item.get('schema_complete')
+                ]
+                if "is not of type 'boolean'" in str(exc):
+                    message += ' Use unquoted JSON booleans true or false (not strings).'
+                if available:
+                    message += f' Available methods for this device: {json.dumps(available, ensure_ascii=False)}.'
+            return message
         return 'RPC not sent: capability discovery or parameter validation failed.'
 
 
@@ -121,6 +148,8 @@ async def execute(client, config, name, args, read_only=False, profile_id=None):
         if name == 'discover_capabilities':
             if not profile_id:
                 return {'success': False, 'error': 'An agent profile is required.'}
+            if (args.get('device_identifier') or args.get('device_name') or args.get('device_id') or '').strip():
+                return await execute(client, config, 'list_available_rpc', args, read_only=read_only, profile_id=profile_id)
             _, _, mcp_tools = _create_mcp_runtime(config, profile_id)
             return redact_credentials(await mcp_tools['discover_capabilities'](), key)
 
@@ -226,6 +255,13 @@ async def execute(client, config, name, args, read_only=False, profile_id=None):
                  'two_way': two_way, 'timeout_ms': timeout_ms},
                 read_only=read_only, profile_id=profile_id,
             )
+            if rpc_result.get('error_code') == 'device_not_found' and 'devices' not in rpc_result:
+                try:
+                    devices = await _all_devices(client, host, headers)
+                    rpc_result['devices'] = [{'name': d.get('name'), 'label': d.get('label'),
+                                              'id': d.get('id', {}).get('id')} for d in devices]
+                except Exception:
+                    pass
             return {'status': 'success' if rpc_result.get('success') else 'error',
                     'device': resolved_name, 'device_id': device_id, 'method': method, **rpc_result}
 
@@ -267,7 +303,11 @@ async def execute(client, config, name, args, read_only=False, profile_id=None):
             payload = {'method': method, 'params': {} if raw_params is None else raw_params}
             error = await authorize_rpc(config, profile_id, device_id, method, payload['params'])
             if error:
-                error_code = 'invalid_params' if 'Invalid parameters' in error else 'unsupported_method'
+                error_code = (
+                    'invalid_params' if 'Invalid parameters' in error
+                    else 'device_not_found' if 'not found' in error.lower()
+                    else 'unsupported_method'
+                )
                 return {'success': False, 'confirmed': False, 'delivery': 'failed',
                         'error_code': error_code, 'error': error}
             if mode == 'twoway':
@@ -363,6 +403,7 @@ MCP_TOOLS = [
                 'type': 'object',
                 'properties': {
                     'device_name': {'type': 'string', 'description': 'Exact name or UUID of the target ThingsBoard device.'},
+                    'keys': {'type': 'array', 'items': {'type': 'string'}, 'description': 'Optional telemetry keys to fetch (e.g. ["temperature", "humidity", "POWER"]).'},
                 },
                 'required': ['device_name'],
             },
@@ -372,11 +413,11 @@ MCP_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'execute_device_action',
-            'description': 'Validate and execute a registered RPC action on a ThingsBoard device through the capability registry (two-way confirmation by default).',
+            'description': 'Validate and execute a registered RPC action on a ThingsBoard device through the capability registry (two-way confirmation by default). Prefer exact device names over guessing UUIDs.',
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'device_identifier': {'type': 'string', 'description': 'Exact target device name or UUID.'},
+                    'device_identifier': {'type': 'string', 'description': 'Exact target device name (preferred) or verified UUID from list_devices.'},
                     'method': {'type': 'string', 'description': 'Registered RPC method name from list_available_rpc.'},
                     'params': {'description': 'JSON parameters matching the discovered parameter schema.'},
                     'two_way': {'type': 'boolean', 'description': 'Wait for confirmed device response (default true).'},

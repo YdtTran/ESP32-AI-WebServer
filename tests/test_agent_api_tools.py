@@ -12,6 +12,31 @@ api_tools = importlib.import_module('platform-bridge.agent_api_tools')
 
 
 class AgentApiToolsTests(unittest.IsolatedAsyncioTestCase):
+    def test_matching_device_normalizes_separators_when_unique(self):
+        devices = [
+            {'name': 'Simulated Tasmota A', 'label': None, 'id': {'id': 'id-a'}},
+            {'name': 'Simulated Tasmota B', 'label': None, 'id': {'id': 'id-b'}},
+            {'name': 'relay-1', 'label': '', 'id': {'id': 'id-r1'}},
+            {'name': 'relay 1', 'label': '', 'id': {'id': 'id-r2'}},
+        ]
+        self.assertEqual(api_tools._matching_device(devices, 'simulated-tasmota-B')['id']['id'], 'id-b')
+        self.assertEqual(api_tools._matching_device(devices, 'Simulated_Tasmota_A')['id']['id'], 'id-a')
+        self.assertIsNone(api_tools._matching_device(devices, 'relay_1'))
+        self.assertIsNone(api_tools._matching_device(devices, 'simulated-tasmota'))
+
+    async def test_unknown_uuid_returns_device_not_found_with_device_list(self):
+        client = AsyncMock()
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {'data': [{'name': 'Simulated Tasmota B', 'label': None, 'id': {'id': '6317f9e0-e1b2-11f1-8712-afcc819282f5'}}], 'hasNext': False}
+        client.get.return_value = resp
+        with patch.object(api_tools, 'authorize_rpc', AsyncMock(return_value='RPC not sent: capability discovery or parameter validation failed (Device not found)')):
+            result = await api_tools.execute(client, {'host': 'http://tb.test', 'api_key': 'private'},
+                'execute_device_action', {'device_identifier': '6303ae91-e1b2-11f1-8712-afcc819282f5', 'method': 'setPower', 'params': {'state': True}},
+                profile_id='agent-a')
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error_code'], 'device_not_found')
+        self.assertEqual(result['devices'][0]['name'], 'Simulated Tasmota B')
+
     async def test_rpc_is_not_sent_without_capability_authorization(self):
         client = AsyncMock()
         with patch.object(api_tools, 'authorize_rpc', AsyncMock(return_value='RPC method is not registered')):
@@ -244,11 +269,14 @@ class AgentApiToolsTests(unittest.IsolatedAsyncioTestCase):
                 {'device_identifier': 'Simulated Tasmota B', 'method': 'togglePower', 'params': {}}, profile_id='agent-a')
             self.assertFalse(bad_method['success'])
             self.assertEqual(bad_method['error_code'], 'unsupported_method')
+            self.assertIn('setPower', bad_method['error'])
+            self.assertIn('"state"', bad_method['error'])
 
             bad_params = await api_tools.execute(http, config, 'execute_device_action',
                 {'device_identifier': 'Simulated Tasmota A', 'method': 'setPower', 'params': {'state': 'yes'}}, profile_id='agent-a')
             self.assertFalse(bad_params['success'])
             self.assertEqual(bad_params['error_code'], 'invalid_params')
+            self.assertIn('Available methods for this device', bad_params['error'])
 
             denied_ro = await api_tools.execute(http, config, 'execute_device_action',
                 {'device_identifier': 'Simulated Tasmota A', 'method': 'setPower', 'params': {'state': True}},
