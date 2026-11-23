@@ -23,8 +23,12 @@ Building requires internet access to Docker Hub, PyPI and the PyTorch CPU index.
    by the ESP32, and set independent random values for `BRIDGE_SECRET` and
    `API_KEY` (generate each with `openssl rand -hex 32`). Set `THINGSBOARD_HOST` and
    `THINGSBOARD_ALLOWED_ORIGINS` to `https://codehelpers.tech`.
-   Configure a ThingsBoard API key in the console if needed; set
-   `THINGSBOARD_API_KEY` in `.env` for the separate native dashboard.
+   Configure `CONSOLE_USERNAME` (e.g. `admin`) and `CONSOLE_PASSWORD`
+   (at least 12 characters) in `.env` so `platform-bridge` automatically
+   creates the initial console account and a starter ThingsBoard agent on
+   startup. Configure a ThingsBoard API key in the console or set
+   `THINGSBOARD_API_KEY` in `.env` for the starter agent and separate native
+   dashboard.
 
    ```sh
    test -e .env || cp .env.example .env
@@ -64,15 +68,17 @@ Building requires internet access to Docker Hub, PyPI and the PyTorch CPU index.
    docker compose -f docker-compose.deploy.yml ps
    ```
 
-   Create the first console account (the command prompts for its password):
+   If `CONSOLE_USERNAME` and `CONSOLE_PASSWORD` (12+ characters) are set in
+   `.env`, `platform-bridge` creates that account and a starter ThingsBoard
+   agent automatically on startup (without overwriting an existing account or
+   its agents). To add extra console accounts manually (prompts for password):
 
    ```sh
-   docker compose -f docker-compose.deploy.yml exec platform-bridge python -m platform-bridge.accounts create admin
+   docker compose -f docker-compose.deploy.yml exec platform-bridge python -m platform-bridge.accounts create alice
    ```
 
-   `CONSOLE_USERNAME` and `CONSOLE_PASSWORD` above configure the separate native
-   dashboard login; they do not create this console account. See
-   [multi-user setup](multi-user-auth.md) for additional accounts.
+   See [multi-user setup](multi-user-auth.md) for additional accounts and
+   password resets.
 
    Open `http://<HOST_IP>:8005` for the console. The OTA URL for devices is
    `http://<HOST_IP>:8005/xiaozhi/ota/`. The address must be reachable from the
@@ -114,21 +120,25 @@ network because the native dashboard password is sent to the bridge at sign-in.
 
 ## State, data, and backups
 
-- **Compose state**: `deploy/platform-data` (mounted at `/app/data` in
-  `platform-bridge` for `accounts.db`, `devices.db`, `capabilities.sqlite3`,
-  and `agents.json`) and `deploy/xiaozhi-data` (mounted at `/app/data` in
-  `xiaozhi-server` for `.config.yaml` and `.mcp_server_settings.json`) are
-  persistent bind mounts, alongside the `ollama-data` Docker volume (plus
-  optional `tasmota-bridge-data` and `capability-data` volumes).
+- **Compose state**: `platform-bridge` stores `accounts.db`, `devices.db`,
+  `capabilities.sqlite3`, and `agents.json` in the persistent Docker named
+  volume `iot_platform_data` (override via `PLATFORM_DATA_VOLUME`, mounted at
+  `/app/data`), which survives repository re-clones and `docker compose down`
+  on the same machine (removed only by `down -v` or `docker volume rm`).
+  `deploy/xiaozhi-data` (mounted at `/app/data` in `xiaozhi-server` for
+  `.config.yaml` and `.mcp_server_settings.json`) stays a bind mount alongside
+  the `ollama-data` Docker volume (plus optional `tasmota-bridge-data` and
+  `capability-data` volumes).
 - **Host data**: `data/` is the default `PLATFORM_DATA_DIR` when running
   `platform-bridge` directly on the host outside `/app`. Keep host-run data
-  separate from `deploy/platform-data/`.
+  separate from the `iot_platform_data` Compose volume (and any legacy
+  `deploy/platform-data/` backup).
 - **MCP profile export**: `PlatformStore.sync_to_agent_profile_json()` writes
   `agent_profile.json` in the bridge working directory on agent updates so
   standalone `thingsboard-mcp` can read it by default. That file is not
   bind-mounted into the deployed `platform-bridge` container, which resolves
   per-agent ThingsBoard credentials in-process.
 
-Keep backups of `deploy/platform-data`, `deploy/xiaozhi-data`, and the Ollama
+Keep backups of the `iot_platform_data` volume, `deploy/xiaozhi-data`, and the Ollama
 volume before moving a live installation. Do not commit those backups, secrets,
 or API keys.

@@ -5,6 +5,7 @@ and coordinates ThingsBoard MCP integration.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import hmac
 import json
@@ -26,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .store import PlatformStore, platform_store, normalize_mac
-from .accounts import AccountStore
+from .accounts import AccountStore, bootstrap_from_env
 from . import agent_api_tools, tool_pipeline
 from .dashboard_integration import router as dashboard_router
 try:
@@ -53,8 +54,16 @@ HOST_IP = os.getenv("HOST_IP", "localhost")
 PUBLIC_WS_URL = os.getenv('PUBLIC_WS_URL', f'ws://{HOST_IP}:{WS_PUBLIC_PORT}/xiaozhi/v1/')
 PUBLIC_OTA_URL = os.getenv('PUBLIC_OTA_URL', f'http://{HOST_IP}:8005/xiaozhi/ota/')
 
-app = FastAPI(title="XiaoZhi Platform Management Bridge", version="1.0.0")
 accounts = AccountStore()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    bootstrap_from_env(accounts)
+    yield
+
+
+app = FastAPI(title="XiaoZhi Platform Management Bridge", version="1.0.0", lifespan=lifespan)
 app.include_router(dashboard_router)
 
 app.add_middleware(

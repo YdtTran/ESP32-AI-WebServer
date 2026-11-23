@@ -12,7 +12,7 @@ services:
     volumes:
       - ./platform-bridge:/app/platform-bridge
       - ./thingsboard-mcp:/app/thingsboard-mcp:ro
-      - ./deploy/platform-data:/app/data
+      - platform-data:/app/data
     environment:
       - PYTHONPATH=/app
       - PYTHONUNBUFFERED=1
@@ -61,3 +61,7 @@ networks:
   default:
     name: iot_assignment_default
     external: true
+
+volumes:
+  platform-data:
+    name: ${PLATFORM_DATA_VOLUME:-iot_platform_data}
